@@ -103,3 +103,14 @@ Expect `correct_rate 1.0`, `hit_max_tokens 0`. All shipped configs pass.
   still holds the weights (don't run a huge LMCache L1 that evicts it).
 - 2 TB host RAM page-caches the weights → keep restarts fast.
 - One container `glm52` on port **8080** (the old Kimi port).
+
+## Determinism / LMCache correctness note
+This stack is **not bit-deterministic at temp 0** (MoE expert routing + TP/DCP
+atomic reductions + async scheduling + b12x kernels). Two identical requests give
+coherent but slightly different outputs — normal for large MoE+TP serving.
+Verified LMCache is NOT the cause: two consecutive cache-HIT runs (identical
+restored KV, temp 0) also differ from each other, so the variation is in decode,
+not the KV restore. **LMCache adds no correctness penalty** (hits are faithful,
+20/20). Estonia on DCP2+LMCache = 5/6 — that's task difficulty × nondeterminism,
+the same any config sees (earlier "3/3" were lucky 3-run samples). Don't expect
+exact reproducibility from this stack regardless of LMCache.
