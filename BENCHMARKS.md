@@ -23,7 +23,7 @@ The stock `serve-glm52.sh` targets a different host; three fixes were needed:
 |---|---|---|
 | `Python interpreter not found .../.venv/bin/python` | script's default venv path absent | `PYTHON_BIN=/opt/venv/bin/python` |
 | NCCL `unhandled system error`, `Could not open XML graph file ""` | image bakes `NCCL_GRAPH_FILE=""`; "-noxml" NCCL opens empty path | `unset NCCL_GRAPH_FILE; USE_NCCL_XML=0` |
-| NCCL `Cuda failure 101 'invalid device ordinal'` | P2P over PCIe across 2 NUMA nodes unsupported | `NCCL_P2P_DISABLE=1` (b12x PCIe all-reduce still carries TP) |
+| NCCL `Cuda failure 101 'invalid device ordinal'` | ~~P2P across 2 NUMA nodes unsupported~~ **wrong — see Phase 10**: forced-P2P driver keys + ACS redirect | ~~`NCCL_P2P_DISABLE=1`~~ superseded 2026-07-03: P2P fixed, now `NCCL_P2P_DISABLE=0` |
 
 Also: host GPUs are `0–7` (image defaults `CUDA_VISIBLE_DEVICES=2–9`).
 Cold start ≈ 25–40 min (NFS weight read dominates); warm restart ≈ 4–6 min
@@ -449,3 +449,81 @@ ValueErrors at boot ("KV cache needed 22.94 GiB > available 18.55 GiB"); set
 (1.00M without LMCache @ gpu_mem 0.95 → ~720k with LMCache @ 0.86). Clean config
 error, not a crash. Choose: full 1M cold-only (DCP2 no-LMCache) OR ~720k + ~150×
 warm-prefill reuse (DCP2+LMCache) OR full 1M + LMCache via DCP4 (slower).
+
+---
+
+# Phase 9 — v13 "eldritch" 20260629 + FlashInfer SM120 (2026-07-01..02)
+
+Image bump to the canonical v13 bugfix build
+`voipmonitor/vllm:eldritch-enlightenment-v8722ac7-b12x8ce61f9-cu132-20260629`
+(20260625 launch build had GPU-CPU sync regressions/OOMs; 20260627 had a DCP
+topk_scores_buffer crash). Speed ≈ v12 on B12X; the win is stability + bugfixes.
+New launcher `vllm-v13.sh`; v12 launcher retained for reference.
+
+**Attention backend A/B (DCP2 MTP3, 15s cells):** `FLASHINFER_MLA_SPARSE_SM120`
+(fuse-less — the fuse pass crashes on this host) beats `B12X_MLA_SPARSE`:
+decode c1 86.9 vs 78.1 (+11%), 128k c2 +16%, KV 1,271,726 vs 1,240,368 (+2.5%),
+prefill +2%. MTP acceptance 69.3% vs 74.9% — net win regardless. Estonia 6/8
+(temp-0 nondeterminism; passes). SM120+MTP was upstream-unvalidated; validated here.
+**SM120 at DCP1 crashes** (illegal memory access in sparse_mla_sm120_decode
+autotune) → launcher defaults SM120 only for DCP>1.
+
+**Flag trials (8 one-variable boots, all on SM120/DCP2/MTP3):** oneshot-allreduce
+32K/256K/1MB flat/−4%; NCCL_BUFFSIZE 16M flat; NCCL_MIN_NCHANNELS 16 −5% c1;
+numactl interleave not reproducible (90.6 c1 @10s, 82.0 @15s confirm); 
+MAX_NUM_BATCHED_TOKENS 16384 crashes at boot (b12x chunk ceiling / AOT ranges).
+Adopted only `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (speed-neutral,
+fragmentation insurance; costs ~1% KV).
+
+---
+
+# Phase 10 — GPU P2P fixed (2026-07-03): the big one
+
+P2P was broken by config, not hardware. Two stacked root causes:
+1. **Forced-P2P driver keys** (`ForceP2P=0x11;RMForceP2PType=1;RMPcieP2PType=2`
+   in `/etc/modprobe.d/nvidia-p2p-override.conf`, from an early experiment) made
+   the driver ADVERTISE P2P everywhere while every mapping failed
+   (`CUDA invalid device ordinal` — the error that originally forced
+   `NCCL_P2P_DISABLE=1`). Community-confirmed cause+fix (06-29 daily summary).
+   Keys removed (backup: `grid_results/nvidia-p2p-override.conf.bak`) + module
+   reload (runbook: `p2p-module-reload.sh` — evicts gpu-operator pods via node
+   labels, stops persistenced, rmmod/modprobe via nsenter).
+2. **ACS redirect on the PCIe switches** (4x Broadcom PEX89000 Gen5, 2 GPUs each):
+   downstream ports had ACSCtl=0x001d (ReqRedir+CmpltRedir+UpstreamFwd) hairpinning
+   ALL peer traffic through the root complex/IOMMU. Cleared to 0x0001 (SrcValid
+   only) via setpci; persisted by host systemd unit `gpu-acs-p2p.service`
+   (raw config-space write at offset 0x176, before kubelet).
+
+**Measured P2P after fix (p2pmark):** intra-socket ~54 GB/s, cross-socket ~49 GB/s
+(was ~42 flat host-staged; direct mappings failed entirely). Concurrent all-cross-
+socket saturates ~155 GB/s aggregate (UPI ceiling — the real structural limit).
+
+**Serving config:** `NCCL_P2P_DISABLE=0` + `VLLM_ENABLE_PCIE_ALLREDUCE=0`.
+Critical interaction: with real P2P, the b12x PCIe oneshot all-reduce COLLAPSES
+batch-1 decode (30 tok/s, reproducible) — tiny-payload cross-socket MMIO latency.
+NCCL everywhere is strictly better.
+
+**Production result (v13-0629 + SM120 + DCP2 + MTP3 + P2P, 15s cells, Estonia 3/3):**
+| metric | v12 prod (07-01) | now | Δ |
+|---|---|---|---|
+| decode 0k c1 | 77.1 | **100.5** | +30% |
+| decode 128k c1 | 65.4 | **96.9** | +48% |
+| decode 0k c8 | 344.6 | **419.8** | +22% |
+| prefill 8k | 1,988 | **3,079** | +55% |
+| prefill 128k | 2,049 | **3,122** | +52% |
+Single-stream decode now exceeds the community bare-metal reference (97.1).
+NOTE: all pre-07-03 numbers in this journal are on the broken-P2P stack.
+Host reboot: driver keys persist; ACS persists via the systemd unit; if the unit
+is ever missing, ACS reverts to redirect (slow mode, still functional).
+
+**luke-test image** (`eldritch-enlightenment-luke-test-v3f65c52-...-20260703`,
+Luke's b12x prefill counteroffensive): on nvfp4 checkpoint NOT worth it yet —
+`fold_values` buffer = max_model_len × 10,240 × fp32/GPU (38 GiB @1M → OOM);
+int32 overflow caps ctx at ~200k (262144×10240 > 2^31); at 192k: Estonia 3/3,
+prefill unchanged (~3.1-3.3k — fast path doesn't engage for modelopt_fp4),
+decode +4-15%. The 5-6k prefill numbers are mxfp4-a8 only. Reported findings;
+retest when the nvfp4 port lands.
+
+**Unlocked for retest by working P2P:** `fuse_allreduce_rms` and SM120@DCP1
+(both crashed under broken P2P), DCP4 (comm tax repriced), overnight grid sweep
+(all axes stale).
