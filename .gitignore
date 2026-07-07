@@ -1,0 +1,34 @@
+# Track ONLY the docs (*.md) and startup shells (*.sh), plus the small patch
+# files those shells mount/depend on. Ignore everything else: GPU/JIT caches,
+# cloned upstream repos, benchmark result JSON, and logs.
+
+# 1) ignore everything by default
+*
+
+# 2) re-include docs and startup/launch shells
+!*.md
+!*.sh
+
+# 2b) re-include the overnight grid-search harness (a reusable tool, not an artifact)
+!grid_search.py
+
+# 3) re-include launcher dependency dirs + the files they need
+#    (tool-call parser patch, and the LMCache mount scripts/patches)
+!patch/
+!patch/*.py
+# v14 image launcher w/ allreduce override (no .sh ext) + vendored LMCache patch set
+!patch/run-glm52-v14-server
+!patch/lmcache-v14/
+!patch/lmcache-v14/*.py
+!lmcache-mnt/
+!lmcache-mnt/*.py
+
+# 4) never descend into caches / clones / refs / result artifacts
+cache/
+cache-v11/
+lmcache_l2/
+rtx6kpro/
+glm-5.2-v11-lmcache/
+image-ref/
+*.json
+*.log

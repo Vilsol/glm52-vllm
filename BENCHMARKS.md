@@ -527,3 +527,44 @@ retest when the nvfp4 port lands.
 **Unlocked for retest by working P2P:** `fuse_allreduce_rms` and SM120@DCP1
 (both crashed under broken P2P), DCP4 (comm tax repriced), overnight grid sweep
 (all axes stale).
+
+---
+
+# Phase 11 — v14 "eldritch v7" + LMCache (2026-07-07)
+
+Image `voipmonitor/vllm:eldritch-enlightenment-v7-vllme2e2eaf-b12x26144c0-cu132-20260707`
+(recipe glm5.2_v14.md). v14 = Luke's b12x rework (beats FlashInfer SM120 — "everything
+b12x now"), online MXFP8 dense-linear conversion, fp8 DMA, hybrid DCP, InstantTensor.
+
+**Host-specific fix (same class as v13):** the image launcher hardcodes the b12x
+PCIe all-reduce, which COLLAPSES batch-1 decode here (c1 30-45 tok/s, reproducible
+across every DCP/MTP/F8 combo). We mount a patched launcher (`patch/run-glm52-v14-server`)
+defaulting `VLLM_ENABLE_PCIE_ALLREDUCE=0` -> NCCL all-reduce. With that: v14 DCP2/1M/A16
+c1 ~90, c8 ~445, prefill ~3.1k, Estonia 3/3 (SM120-free B12X path is also free of the
+fold_values OOM, so 1M context boots fine — KV ~1.15M @ gpu0.93). f8=ring adds prefill
+but rides the same PCIe-DMA path we disable, so it's off here.
+
+## LMCache WORKS on v14 (production: `vllm-v14-lmcache.sh`, DCP2 + 768GB RAM)
+
+Community MP-connector port (myshytf), vendored in `patch/lmcache-v14/` + patched
+`patch/serve_glm52_v14_lmcache.sh` (lmcache 0.4.6 pip-installed at container start,
+12 patches applied). How it's wired:
+- `--kv-transfer-config {kv_connector: LMCacheMPConnector, kv_role: kv_both}` + a
+  local ZMQ MP server holding the RAM cache; `--disable-hybrid-kv-cache-manager`.
+- **RAM-only** (`L2_GB=0` drops the disk adapter): L1 = 768 GB pinned = ~15M tokens
+  (53.4 KB/token measured from LMCache's KVLayerGroupInfo). ~16 users' 300k contexts.
+- DCP2 (1.09M GPU pool) for speed; LMCache restores evicted contexts from RAM.
+- Host overrides: `VLLM_ENABLE_PCIE_ALLREDUCE=0` (as above); large-L1 boot needs
+  `GLM52_LMCACHE_MQ_TIMEOUT>=pinning-time` (768GB pins ~75s > the stock 30s register
+  timeout -> we default 300s).
+
+**Validated:** Estonia 5/5; bench within ~3% of plain v14 DCP2 (connector tax); 1M
+context fits (KV 1.06M). **Warm restore proof (DCP2, 768GB):** cold 297k-token prefill
+164.6s; after evicting from the GPU pool, re-send restored from RAM in **3.3s = 49x**
+faster (lookup_hit_tokens confirmed the hit). Observability: `:8088/metrics`
+(RAM-only, so no l2_* metrics; use `l1_write_chunks_total`/`l1_evicted_chunks_total`
+names, not the newer doc names). Hit rate =
+`lookup_hit_tokens_total / lookup_requested_tokens_total`.
+
+Note: rides community patches on a day-old image; revisit when festr bakes LMCache in
+or the nvfp4-KV image lands (both will likely need a patch refresh).
