@@ -52,6 +52,29 @@ RECV_NEW = (
 )
 RECV_MARKER = "patched recv guard"
 
+# Patch 3 — finished_recving loop, `else` branch. On a KV-recv completion for a
+# request that is NOT WAITING_FOR_REMOTE_KVS, the pristine code asserts the req
+# is in a finished state before freeing its blocks. Under KV-cache-pressure
+# preemption + LMCache SafePreemptRestore, a recv-finished callback can arrive
+# for a still-active (preempted/running) request, so `is_finished` is False and
+# the hard assert kills EngineCore (observed 2026-07-14). Guard it: free only
+# when finished; otherwise log and keep the request scheduled.
+ISFIN_OLD = (
+    "                assert RequestStatus.is_finished(req.status)\n"
+    "                self._free_blocks(self.requests[req_id])\n"
+)
+ISFIN_NEW = (
+    "                if RequestStatus.is_finished(req.status):\n"
+    "                    self._free_blocks(self.requests[req_id])\n"
+    "                else:\n"
+    "                    logger.warning(\n"
+    "                        \"Finished recving KV transfer for request %s in \"\n"
+    "                        \"non-finished status %s (LMCache preempt/restore \"\n"
+    "                        \"race; patched is_finished guard) — not freeing \"\n"
+    "                        \"blocks.\", req_id, req.status)\n"
+)
+ISFIN_MARKER = "patched is_finished guard"
+
 
 def apply(src: str, name: str, old: str, new: str, marker: str) -> str:
     if marker in src:
@@ -81,6 +104,7 @@ def main() -> int:
 
     src = apply(src, "finished_sending", SEND_OLD, SEND_NEW, SEND_MARKER)
     src = apply(src, "finished_recving", RECV_OLD, RECV_NEW, RECV_MARKER)
+    src = apply(src, "recv_is_finished", ISFIN_OLD, ISFIN_NEW, ISFIN_MARKER)
 
     with open(SCHED, "w") as f:
         f.write(src)

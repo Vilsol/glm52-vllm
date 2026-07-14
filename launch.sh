@@ -40,6 +40,8 @@ docker run -d --name "$NAME" \
   --device nvidia.com/gpu=all --ipc=host --network host --privileged \
   --entrypoint /entrypoint.sh \
   -v /root/glm52-vllm/entrypoint.sh:/entrypoint.sh:ro \
+  -v /root/glm52-vllm/certs:/certs:ro \
+  ${TLS_ENABLE:+-e TLS_ENABLE=$TLS_ENABLE} \
   -e PYTHON_BIN=/opt/venv/bin/python \
   -e NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \
   ${NCCL_P2P_DISABLE:+-e NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE} \

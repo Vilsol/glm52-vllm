@@ -169,8 +169,16 @@ mkdir -p \
 
 # ── vLLM serve args ─────────────────────────────────────────────────────
 hf_overrides="$(printf '{"use_index_cache":true,"index_topk_pattern":"%s"}' "${GLM52_INDEX_TOPK_PATTERN}")"
+
+# TLS (local patch): serve HTTPS from the mounted self-signed cert when TLS_ENABLE=1.
+tls_args=()
+if [[ "${TLS_ENABLE:-0}" == "1" ]]; then
+  tls_args=(--ssl-keyfile "${TLS_KEY:-/certs/key.pem}" --ssl-certfile "${TLS_CERT:-/certs/cert.pem}")
+fi
+
 args=(
   -m vllm.entrypoints.cli.main serve "${MODEL}"
+  "${tls_args[@]}"
   --served-model-name "${SERVED_MODEL_NAME_ARGS[@]}"
   --host 0.0.0.0
   --port "${PORT}"

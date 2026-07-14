@@ -38,7 +38,7 @@ set -euo pipefail
 
 IMAGE="${IMAGE:-voipmonitor/vllm:eldritch-enlightenment-v7-vllme2e2eaf-b12x26144c0-cu132-20260707}"
 NAME="${NAME:-glm52}"
-PORT="${PORT:-8080}"
+PORT="${PORT:-8443}"
 CACHE_ROOT="${CACHE_ROOT:-/root/glm52-vllm/cache-v14}"
 
 MODEL_HOST="${MODEL_HOST:-$(echo /root/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/snapshots/*/ )}"
@@ -82,10 +82,16 @@ docker run -d --name "$NAME" \
   -e F8_DMA="${F8_DMA:-ring}" \
   -e LOAD_FORMAT="${LOAD_FORMAT:-instanttensor}" \
   -e INSTANTTENSOR_BACKEND="${INSTANTTENSOR_BACKEND:-BUFFERED}" \
+  -e INSTANTTENSOR_CONCURRENCY="${INSTANTTENSOR_CONCURRENCY:-16}" \
+  ${INSTANTTENSOR_IO_DEPTH:+-e INSTANTTENSOR_IO_DEPTH=$INSTANTTENSOR_IO_DEPTH} \
   -e QUANTIZATION="${QUANTIZATION:-modelopt_fp4}" \
   -e GLM52_INDEX_TOPK_PATTERN="FFFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSS" \
   -e VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-0}" \
+  -e TLS_ENABLE="${TLS_ENABLE:-0}" \
+  -e TLS_CERT="${TLS_CERT:-/certs/cert.pem}" \
+  -e TLS_KEY="${TLS_KEY:-/certs/key.pem}" \
   -v /root/glm52-vllm/patch/run-glm52-v14-server:/usr/local/bin/run-glm52-v14-server:ro \
+  -v /root/glm52-vllm/certs:/certs:ro \
   -v /root/.cache/huggingface:/root/.cache/huggingface \
   -v "$CACHE_ROOT/cache:/cache" \
   -v "$CACHE_ROOT/tmp:/container-tmp" \

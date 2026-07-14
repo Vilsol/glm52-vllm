@@ -27,12 +27,21 @@
 #
 # NOTE from upstream: do NOT combine with PYTORCH_CUDA_ALLOC_CONF=
 # expandable_segments (the MP connector fights it; script unsets it).
+#
+# INSTANTTENSOR_CONCURRENCY (2026-07-09): default 16 (auto would be
+# min(32,cpu)//world_size = 4). BENCHMARKED cold: total boot 28 min @16 vs 36 min
+# @4 (~22% faster, N=1 each so partly variance). PEAK NFS throughput is unchanged
+# at ~270 MB/s either way — the single Longhorn RWX NFS share-manager caps it, and
+# nconnect=16 hits the same wall. The time win comes from fewer pipeline STALLS
+# (more reads in flight -> higher AVERAGE throughput), not a higher ceiling.
+# Kept at 16 (helps or is harmless; 32 worth trying). The real cold-boot fix is a
+# Longhorn RWO *block* volume (bypasses the share-manager). Warm boots ~5 min.
 ###############################################################################
 set -euo pipefail
 
-IMAGE="${IMAGE:-voipmonitor/vllm:eldritch-enlightenment-v7-vllme2e2eaf-b12x26144c0-cu132-20260707}"
+IMAGE="${IMAGE:-voipmonitor/vllm:fathomless-firmament-v17-vllm6ccc3eb-b12x1377d5f-fi801d57a-cu132-20260714}"
 NAME="${NAME:-glm52}"
-PORT="${PORT:-8080}"
+PORT="${PORT:-8443}"
 CACHE_ROOT="${CACHE_ROOT:-/root/glm52-vllm/cache-v14}"
 L2_HOST_DIR="${L2_HOST_DIR:-/var/lib/lmcache-l2}"
 PATCH_DIR=/root/glm52-vllm/patch
@@ -73,15 +82,22 @@ docker run -d --name "$NAME" \
   -e MOE_MODE="${MOE_MODE:-a16}" \
   -e F8_DMA="${F8_DMA:-0}" \
   -e LOAD_FORMAT="${LOAD_FORMAT:-instanttensor}" \
+  -e INSTANTTENSOR_CONCURRENCY="${INSTANTTENSOR_CONCURRENCY:-16}" \
+  ${INSTANTTENSOR_IO_DEPTH:+-e INSTANTTENSOR_IO_DEPTH=$INSTANTTENSOR_IO_DEPTH} \
   -e VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-0}" \
+  -e DCP_PREFILL_WORKSPACE="${DCP_PREFILL_WORKSPACE:-auto}" \
   -e FUSE_ALLREDUCE="${FUSE_ALLREDUCE:-0}" \
   -e GLM52_ENABLE_LMCACHE=1 \
   -e GLM52_LMCACHE_L1_GB="${LMCACHE_L1_GB:-768}" \
   -e GLM52_LMCACHE_L1_INIT_GB="${LMCACHE_L1_INIT_GB:-64}" \
   -e GLM52_LMCACHE_L2_GB="${LMCACHE_L2_GB:-0}" \
   -e GLM52_LMCACHE_CHUNK_SIZE="${LMCACHE_CHUNK_SIZE:-256}" \
+  -e TLS_ENABLE="${TLS_ENABLE:-0}" \
+  -e TLS_CERT="${TLS_CERT:-/certs/cert.pem}" \
+  -e TLS_KEY="${TLS_KEY:-/certs/key.pem}" \
   -v "$PATCH_DIR/serve_glm52_v14_lmcache.sh:/opt/serve_glm52_v14_lmcache.sh:ro" \
   "${PATCH_MOUNTS[@]}" \
+  -v /root/glm52-vllm/certs:/certs:ro \
   -v /root/.cache/huggingface:/root/.cache/huggingface \
   -v "$CACHE_ROOT/cache:/cache" \
   -v "$CACHE_ROOT/tmp:/container-tmp" \

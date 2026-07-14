@@ -41,7 +41,7 @@ set -euo pipefail
 export IMAGE="${IMAGE:-voipmonitor/vllm:eldritch-enlightenment-v8722ac7-b12x8ce61f9-cu132-20260629}"
 export CACHE_ROOT="${CACHE_ROOT:-/root/glm52-vllm/cache-v13-0629}"   # build-specific AOT cache
 export NAME="${NAME:-glm52}"
-export PORT="${PORT:-8080}"
+export PORT="${PORT:-8443}"
 
 # Context / parallelism. DCP2 fits ~1M at gpu_mem 0.95 (measured KV ~1.24M). If boot
 # ValueErrors "estimated maximum model length < max_model_len", lower MAX_MODEL_LEN.
@@ -90,6 +90,13 @@ if [[ -z "${ATTN_BACKEND:-}" && "${DCP_SIZE}" -gt 1 ]]; then
   ATTN_BACKEND="FLASHINFER_MLA_SPARSE_SM120"
 fi
 if [[ -n "${ATTN_BACKEND:-}" ]]; then EXTRA_ARGS+=" --attention-backend ${ATTN_BACKEND}"; fi
+
+# TLS: serve HTTPS with the self-signed cert (mounted at /certs by launch.sh).
+# Default off (plain HTTP). TLS_ENABLE=1 serves HTTPS; clients then use https:// + -k (self-signed).
+export TLS_ENABLE="${TLS_ENABLE:-0}"
+if [[ "${TLS_ENABLE}" == "1" ]]; then
+  EXTRA_ARGS+=" --ssl-keyfile ${TLS_KEY:-/certs/key.pem} --ssl-certfile ${TLS_CERT:-/certs/cert.pem}"
+fi
 
 # Reuse the shared experiment launcher (host NCCL/P2P fixes via entrypoint.sh).
 exec bash /root/glm52-vllm/launch.sh
