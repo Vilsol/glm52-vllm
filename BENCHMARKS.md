@@ -568,3 +568,70 @@ names, not the newer doc names). Hit rate =
 
 Note: rides community patches on a day-old image; revisit when festr bakes LMCache in
 or the nvfp4-KV image lands (both will likely need a patch refresh).
+
+---
+
+# Phase 12 — v15/v17 fathomless-firmament, TLS, LMCache crash fix (2026-07-13..15)
+
+## Image progression
+- **v15** = `fathomless-firmament-v19-vllm0d1ad03-b12x90172a5-cu132-20260709`. Pure
+  rebase of the v14 runtime onto `dev/fathomless-firmament` (CuTe compile fallback,
+  restored DCP A2A token cap). Our launcher (`run-glm52-v*-server`) is **byte-identical**
+  across v14/v15/v17, so image bumps are a one-line `IMAGE=` swap. MTP0 cc1 vs v14: noise
+  (+0.5–2%). Rode it in on a restart, not a dedicated one.
+- **v17 (PRODUCTION)** = `fathomless-firmament-v17-vllm6ccc3eb-b12x1377d5f-fi801d57a-cu132-20260714`
+  (recipe glm5.2_v17.md). Adds generalized DCP prefill workspace (PR #94), NF3-hybrid
+  format/NVFP4-KV (for the TP4 madeby561 checkpoint — not us), B12X NF3 tile-binding fix.
+  For our TP8/DCP2 the only applicable gain is PR #94 prefill (+3.5–4.8% per the doc);
+  wired via `DCP_PREFILL_WORKSPACE=auto` in `vllm-v14-lmcache.sh`. Decode/KV/quality
+  unchanged. `vllm-v14-lmcache.sh` default IMAGE now points here.
+
+## TLS + port (2026-07-13)
+Self-signed cert (RSA-4096, 1000-yr expiry, in `certs/`, gitignored key) wired via
+`--ssl-keyfile/--ssl-certfile` behind `TLS_ENABLE`. **Cilium Hubble DPI on port 8080
+mangles TLS** (works as HTTP, breaks as HTTPS) — moved to **8443**. Later disabled TLS
+(`TLS_ENABLE=0` default) at user request; service = plain HTTP on 8443. uvicorn can't
+toggle TLS live, so flipping it = a process restart.
+
+## LMCache KV-xfer crash + fix (2026-07-14) — IMPORTANT
+Under real load (`Running: 10, GPU KV 88.6%`) the engine died:
+`assert RequestStatus.is_finished(req.status)` in scheduler `_update_from_kv_xfer_finished`
+→ EngineCore fatal → EngineDeadError. Trigger: KV-cache-pressure **preemption** +
+LMCache `SafePreemptRestore` fires a recv-finished callback for a still-active
+(preempted) request. `patch_kv_xfer_assert_v10.py` guarded only 2 of the 3 asserts in
+that function. **Fix:** Patch 3 (guarded skip — free only if finished, else log & keep
+scheduled). Present on both v15 and v17 bases; validated (applies + compiles) on both.
+GOTCHA: the launcher applies the **external** clone `/root/glm-5.2-v11-lmcache/patches/`,
+which overrode the vendored edit — synced both, then repointed the launcher at the
+committed vendored `patch/lmcache-v14/` (dirs are now byte-identical) so the fix can't
+drift. See memory `lmcache-patch-external-clone-overrides`.
+
+## v17 bench (llm-inference-bench 0.4.24, live LMCache/DCP2/MTP3, ctx0)
+| c1 | c4 | c8 | c16 | c32 |
+|---:|---:|---:|---:|---:|
+| 91.2 | 288.6 | 440.6 | **657.2** | 644.2 |
+
+Prefill (client prompt/TTFT): 8k 3,047 · 64k 3,224 · 128k 3,180 tok/s (flat to 128k).
+`c32≈c16` because `MAX_NUM_SEQS=16` caps running seqs (not a cliff). `c1=91` matches the
+Phase-11 v14 ~90 → **no regression**. c1 ~19% under the LMCache-free/131k reference is the
+connector + 1M-ctx tax, not a v17 issue. MTP accept ~2.7, VRAM 97.5%, GPUs 93% / 2.1 kW.
+
+## Cold-boot: the LMCache pin self-evicts the weights
+Every LMCache cold boot loads at NFS speed (~270 MB/s, ~20–30 min) even when weights were
+just page-cache-warm: pinning the 768 GB L1 reclaims physical pages and **evicts the idle
+436 GB weight cache** (weights live on GPU after load → first LRU victims). Confirmed:
+post-load `vmtouch` shows 96.5% resident, but the next boot is cold anyway. InstantTensor
+`BUFFERED` is NOT wonky — it populates cache correctly; the pin just evicts it.
+**Fix (respects no-node-local-disk rule):** `vmtouch -dl <blobs>` to mlock the 436 GB
+(1.2 TB locked of 2 TB) → future restarts stay ~5 min. Not yet applied.
+
+## Checkpoint alternatives evaluated — stay on `lukealonso/GLM-5.2-NVFP4`
+- **madeby561/GLM-5.2-MXFP8-NVFP4-NF3-Hybrid** (v17 TP4): higher headline GPQA but the win
+  is vs plain NVFP4, not our A16 (KLD 0.060). It mandates `nvfp4_ds_mla` KV (breaks our
+  fp8-calibrated LMCache), NF3 tile geometry is TP4-only (untested/fragile at TP8), MTP-off.
+  Built for memory-starved 4-GPU serving — the regime we're not in. **No.**
+- **RedHatAI/GLM-5.2-NVFP4-FP8**: **compressed-tensors** (LLM Compressor), NOT modelopt_fp4.
+  Routes through vLLM's generic compressed-tensors MoE path, **not B12X** → loses the whole
+  B12X kernel stack (MoE + B12X_MLA_SPARSE). Attention is FP8-block weights; needs vLLM
+  PR #47780; MTP undocumented; GPQA 89.1 (−2.1, ~plain NVFP4, below the hybrid). Engineered
+  for stock vLLM TP4. **No** — B12X is exactly what makes us fast.

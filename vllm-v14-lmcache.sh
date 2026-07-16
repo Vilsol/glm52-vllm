@@ -47,8 +47,11 @@ L2_HOST_DIR="${L2_HOST_DIR:-/var/lib/lmcache-l2}"
 PATCH_DIR=/root/glm52-vllm/patch
 # LMCache DCP patches: vendored in patch/lmcache-v14 (self-contained); falls back
 # to an external myshytf clone if present. See patch/lmcache-v14/SOURCE.md.
+# Use the committed vendored patches (source of truth). The external myshytf clone
+# at /root/glm-5.2-v11-lmcache/patches USED to override this, which silently ignored
+# vendored edits (bit us with the KV-xfer crash fix, 2026-07-14). Dirs are now
+# byte-identical; override only via an explicit LMC_PATCHES=... if ever needed.
 LMC_PATCHES="${LMC_PATCHES:-$PATCH_DIR/lmcache-v14}"
-[[ -d /root/glm-5.2-v11-lmcache/patches ]] && LMC_PATCHES=/root/glm-5.2-v11-lmcache/patches
 
 MODEL_HOST="${MODEL_HOST:-$(echo /root/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/snapshots/*/ )}"
 MODEL_HOST="${MODEL_HOST%/}"

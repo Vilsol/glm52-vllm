@@ -100,9 +100,14 @@ Expect `correct_rate 1.0`, `hit_max_tokens 0`. All shipped configs pass.
 
 ## Operational notes
 - Cold start ~25–40 min (NFS weight read); warm restart ~5 min IF the page cache
-  still holds the weights (don't run a huge LMCache L1 that evicts it).
+  still holds the weights. NOTE (Phase 12): the 768 GB LMCache L1 pin **evicts**
+  the 436 GB weight cache on every boot (weights are idle on-GPU → first LRU
+  victims), so cold is the norm. Fix = `vmtouch -dl <blobs>` to mlock them (RAM,
+  not disk); not yet applied.
 - 2 TB host RAM page-caches the weights → keep restarts fast.
-- One container `glm52` on port **8080** (the old Kimi port).
+- One container `glm52` on port **8443** (plain HTTP, TLS off; 8080 is
+  Cilium-Hubble-DPI'd and mangles TLS). Production image = v17 fathomless-firmament
+  via `vllm-v14-lmcache.sh`.
 
 ## Determinism / LMCache correctness note
 This stack is **not bit-deterministic at temp 0** (MoE expert routing + TP/DCP
