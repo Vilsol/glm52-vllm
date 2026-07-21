@@ -635,3 +635,33 @@ post-load `vmtouch` shows 96.5% resident, but the next boot is cold anyway. Inst
   B12X kernel stack (MoE + B12X_MLA_SPARSE). Attention is FP8-block weights; needs vLLM
   PR #47780; MTP undocumented; GPQA 89.1 (−2.1, ~plain NVFP4, below the hybrid). Engineered
   for stock vLLM TP4. **No** — B12X is exactly what makes us fast.
+
+---
+
+# Phase 13 — v18/v19 "Gilded Gnosis" CKV-gather; DCP8 vs DCP2 (2026-07-21)
+
+koush's full-CKV DCP prefill (vLLM PR #111) shipped in the gilded-gnosis images
+(v18 gated it to TP8/DCP4+DCP8; **v19 extends the gate to 8:2**). We swept it.
+Image: `gilded-gnosis-v19-vllm7ea567a-b12xc7dc733-fi801d57a-cu132-20260719`.
+Bench: llm-inference-bench @86cf05c, 15s/cell, idle. TP8/MTP3/A16/fp8-KV. Aggregate decode tok/s @ctx0.
+
+| Config | c1 | c8 | c16 | pf8k | pf128k | KV | LMCache | warm-restore |
+|---|--:|--:|--:|--:|--:|--:|:-:|:-:|
+| v17 DCP2 (old prod) | 86.9 | 435 | 662 | 3,019 | 3,175 | 1.07M | y | y |
+| **v19 DCP2 +LMCache (NEW PROD)** | **101.8** | **448** | **689** | **3,779** | **3,973** | 1.04M | y | 18.6× |
+| v19 DCP2 no-LMCache | 97.0 | 447 | 670 | 3,939 | 3,989 | 1.07M | n | n |
+| v19 DCP8 PCIE0 | 54.2 | 76 | 95 | 2,816 | ~2,861 | 3.69M | n | - |
+| v19 DCP8 PCIE1 | 29.5 | 71 | 95 | 3,277 | ~2,861 | 3.69M | n | - |
+
+**DCP8 is unusable on this host.** Decode collapses ~7× (c16 662→95) *independent of PCIe
+all-reduce backend* — CKV engages fine; the wall is DCP8's 8-way cross-NUMA all-reduce per
+decode token on our PCIe-only 2-NUMA fabric (GPU0-3 / 4-7). koush's ~2× were on non-NUMA
+PCIe-x8 boxes. My PCIe-allreduce=0 host-fix (right for DCP2 batch-1) is irrelevant here;
+both backends collapse. Not pursuing DCP8.
+
+**v19/DCP2 + LMCache = new production.** vs v17: decode c1 +17% (87→102), c16 +4%; prefill
++25% at 8k/128k — CKV-gather delivering *at DCP2*. Warm-restore intact (18.6× on a 90k re-send),
+same 1M KV, same topology. All 12 LMCache patches + 3 KV-xfer guards apply cleanly on
+gilded-gnosis (no re-validation needed). LMCache adds no throughput penalty.
+Launcher: `vllm-v19-lmcache.sh` (DCP2, gpu_mem 0.94). 64k prefill omitted from headline
+(single-scout JIT-spike noise; 8k/128k stable). Cold-boot caveat unchanged (768GB pin evicts weights).
