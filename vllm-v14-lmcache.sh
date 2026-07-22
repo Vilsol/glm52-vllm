@@ -68,7 +68,6 @@ done
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
 docker run -d --name "$NAME" \
-  --restart unless-stopped \
   --device nvidia.com/gpu=all --network host --ipc host --init --shm-size 32g \
   --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=1048576:1048576 \
   -e GPUS="${GPUS:-0,1,2,3,4,5,6,7}" \
@@ -81,7 +80,7 @@ docker run -d --name "$NAME" \
   -e MTP="${MTP:-3}" \
   -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}" \
   -e GRAPH="${GRAPH:-64}" \
-  -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-1024000}" \
+  -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-917504}" \
   -e GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.94}" \
   -e MOE_MODE="${MOE_MODE:-a16}" \
   -e F8_DMA="${F8_DMA:-0}" \
