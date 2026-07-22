@@ -13,7 +13,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 NAME=glm52
 URL=http://127.0.0.1:8443/health
-LAUNCH="bash /root/glm52-vllm/vllm-v14-lmcache.sh"
+LAUNCH="bash /root/glm52-vllm/vllm-v19-lmcache.sh"   # current production (v19/DCP2/LMCache/CKV)
 LOG=/root/glm52-vllm/watchdog.log
 
 CHECK_INTERVAL=15     # seconds between health probes
