@@ -11,6 +11,10 @@
 
 # 2b) re-include the overnight grid-search harness (a reusable tool, not an artifact)
 !grid_search.py
+# 2c) losslessness capture/compare harness (see BENCHMARKS.md Phase 14 §2 -- the
+#     byte-comparison it performs is invalid on this stack today, but the harness
+#     is kept for if/when batch-invariant kernels make it meaningful)
+!spec-extend-lossless-check.py
 
 # 3) re-include launcher dependency dirs + the files they need
 #    (tool-call parser patch, and the LMCache mount scripts/patches)

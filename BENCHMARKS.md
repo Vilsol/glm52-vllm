@@ -665,3 +665,125 @@ same 1M KV, same topology. All 12 LMCache patches + 3 KV-xfer guards apply clean
 gilded-gnosis (no re-validation needed). LMCache adds no throughput penalty.
 Launcher: `vllm-v19-lmcache.sh` (DCP2, gpu_mem 0.94). 64k prefill omitted from headline
 (single-scout JIT-spike noise; 8k/128k stable). Cold-boot caveat unchanged (768GB pin evicts weights).
+
+---
+
+# Phase 14 — long-context prefill, SPEC_EXTEND A/B, GPU health (2026-07-23)
+
+Image unchanged: `gilded-gnosis-v19-...-20260719`. TP8/DCP2/MTP3/A16/fp8-KV, LMCache on.
+**We do NOT move to v20**: three independent DCP-regression reports on 2026-07-22
+(`ValueError: DCP workspace projection received an invalid tensor layout` at DCP2 *and*
+DCP8; `DCP_PREFILL_WORKSPACE=auto/1` worked on v19, so it is a v20 regression; setting it
+to 0 trades the crash for startup read faults). niklasb1337 reverted to a patched v19.
+v20 also crashed for johnblackwell6000 at DCP4/TP8/MTP3. Revisit when those are fixed.
+
+## 1. Prefill past 128k — the DCP4 taper does NOT reproduce at DCP2
+
+**First finding: `llm-inference-bench` silently caps prefill at 128k.**
+`llm_decode_bench.py:12553` computes `max_prefill = min(131072, server_context_length-64)`
+and *discards* any `--prefill-contexts` above it with no warning. Every DCP-taper number
+circulating in the RTX6kPRO Discord is therefore measured inside a ≤128k window, while
+people run 262k+ in production. Local patch adds `LLM_BENCH_MAX_PREFILL` and logs drops.
+(Patch lives in the `llm-inference-bench` clone, not this repo — reapply after `git pull`.)
+
+Prefill tok/s, client metric, N=1/point, idle, DCP2 + CKV gather:
+
+| ctx | 8k | 64k | 128k | 256k | 512k | 768k |
+|---|--:|--:|--:|--:|--:|--:|
+| tok/s | 2,754 | 3,458 | 3,862 | **3,843** | 2,942 | 3,149 |
+| TTFT s | 2.98 | 18.65 | 33.37 | 67.04 | 175.08 | 245.31 |
+
+**Flat 128k → 256k**, then a soft ~20% step down (512k/768k are inverted, so at N=1 treat
+them as one level, not a trend). Compare ufear on **DCP4**: 5k @ctx0 → 2k @128k, a 60%
+collapse *inside the range where we are flat*; DCP8 flat ~3.8k. koush only ever tested the
+gather at DCP8 and warns DCP≠TP adds comms. **Conclusion: the taper others see does not hit
+our DCP2. Keep `VLLM_B12X_MLA_CKV_GATHER=1`.**
+
+## 2. Byte-identical verification is INVALID on this stack
+
+The correctness recipe circulating in Discord (temp-0 greedy; MTP3-flag-on vs flag-off vs
+MTP0 must be byte-identical) **cannot work here**. Control experiment: same config, same
+seed, `temperature=0`, verified-idle server, two captures back-to-back, nothing changed:
+
+| prompt | count | code | prose | recall | cjk |
+|---|:-:|:-:|:-:|:-:|:-:|
+| A vs B | IDENTICAL | differs @102 | differs @50 | n/a | differs @40 |
+
+4/5 diverge with *no* variable changed. Only the short, tightly-constrained `count` prompt
+is stable — consistent with batch-composition nondeterminism (reduction order perturbs
+logits ~1 ULP, flips a near-tie, diverges from there); fp8 KV and MTP timing likely add to
+it. **Any byte-comparison here reports "not lossless" unconditionally.** Anyone using that
+test to accept/reject a kernel flag is reading noise. Tool: `spec-extend-lossless-check.py`
+(kept — the capture/compare harness is still the right shape if batch-invariant kernels
+ever land). Note this server names the reasoning field `reasoning`, NOT `reasoning_content`;
+some prompts spend the entire token budget there and return `content: null`.
+
+## 3. `VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE=1` — A/B, two cold boots
+
+Routes the MTP q_len=4 verify batch through the sparse *decode* kernel instead of
+extend/prefill. Off by default in v19; the in-tree comment (`b12x_mla_sparse.py:1065`)
+warns later verify rows must attend to earlier draft rows. festr measured 127→160 tok/s and
+verified it lossless — but **on the v20 kernel**, so we re-verified on ours.
+Byte-comparison being unusable (§2), correctness was judged on **MTP acceptance rate**:
+a verifier scoring drafts wrongly must shift acceptance.
+
+| | flag=0 | flag=1 | Δ |
+|---|--:|--:|--:|
+| decode c1 | 96.0 | **104.5** | **+8.9%** |
+| decode c8 | 468.8 | 449.8 | −4.1% |
+| decode c16 | 705.5 | 676.3 | −4.1% |
+| prefill 8k / 128k | 3,905 / 3,981 | 3,874 / 3,916 | ~flat |
+| **MTP accept** | **60.86%** (17,034/27,990) | **60.70%** (16,244/26,760) | **−0.16pp** |
+
+**Acceptance is flat at ~0.4σ** (pooled SE ≈0.42pp; drafts are correlated within sequences
+so true SE is larger still) — no evidence of verifier corruption. **Shipped: flag=1 is the
+launcher default**; `VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE=0` reverts with no image change.
+Caveats: our +8.9% is well short of festr's +26%, c8/c16 came back ~4% *lower* (N=1, 15s
+cells — I would not defend −4% as real, but there is no multi-stream win either), and the
+flag=1 64k prefill point (3,041) is a single-sample outlier, discarded. Acceptance rate is
+a proxy; the conclusive test is task accuracy (GSM8K/GPQA per config) — not yet run.
+
+## 4. GPU health — all 8 cards clean
+
+koush found a faulty SM botching the hardware fp8 E4M3→f16 conversion (`cvt.rn.f16x2.e4m3x2`),
+after 2 days chasing nondeterministic output. His isolated repro, swept over our 8 GPUs
+(`run-fp8-sweep.sh`, 10,000 iters each, ~12 s/GPU): **CLEAN on all 8, 0 glitches.**
+Our VBIOS `98.02.81.00.01` is newer than his faulty card (`98.02.52.00.02`); consistent with
+an early-unit issue. **This clears GPU 3 — where the §5 crash landed — so that fault is the
+B12X kernel, not silicon.** "Clean at this exposure" ≠ proven good; his fault took 2 days to
+surface. Two upstream bugs found reviewing his source, worth reporting back:
+(a) **no CUDA error checking at all** — after an Xid every call fails silently and it prints
+`RESULT: CLEAN`, i.e. a real fault reports success. We added hard `CUDA_CHECK` + device-count
+validation before running; kernel math left byte-identical so results stay comparable.
+(b) the warp reduction starts at `offset = LANES_PER_ROW` instead of `LANES_PER_ROW/2`, so
+each output sums across two adjacent rows — harmless for the replica-vs-replica diagnostic,
+but the printed floats are meaningless (as is hw-vs-sw, whose LUT is wrong for `exp==15`).
+The `.cu` itself is NOT vendored here (third-party, from Discord); `run-fp8-sweep.sh`
+expects a `fp8_scale_test` binary built from it.
+
+## 5. New crash signature: deep prefill → decode warmup
+
+Killed a server at 22 h uptime. After the 768k prefill sweep completed, the decode grid
+errored out entirely and the container exited:
+
+```
+Worker_TP3_DCP1  WorkerProc hit an exception
+  deepseek_v2.py:1555 forward → cuda_graph.py:259 → piecewise_backend.py:380
+  cudaErrorIllegalAddress
+```
+
+Same family as the 2026-07-16 B12X paged-indexer illegal-memory crash. Likely trigger: the
+bench's pre-decode warmup runs at "C=1 max-runnable context", which immediately after a 768k
+prefill is an extremely deep context. **Not hardware** (§4 clears GPU 3). Watchdog detected
+in ~60 s and restarted cleanly (1/3 in window). Not yet deliberately reproduced — worth
+doing, as it is a sharper lead on the ~19.5 h-MTBF hangs than anything so far.
+**Operational lesson: dump `docker logs` to a file the instant a container exits** — the
+watchdog recycled the container while I was reading the trace and the full stack was lost.
+
+## 6. Bench hygiene — gate on idle
+
+Two runs today were wasted by real user traffic on the server (`running_reqs=2/1`, `9/8`;
+at c16 the extra stream pushed past `MAX_NUM_SEQS=16` so a request queued, warmup never
+stabilised, and the cell reported `∅ (16/16)` capacity-limited). The contaminated numbers
+(c1 64.6 vs 96.0 clean) looked exactly like a 33% regression. **Always gate a bench on
+`vllm:num_requests_running == 0` and re-check after** — a one-line guard that saves an hour.

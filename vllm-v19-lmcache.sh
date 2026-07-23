@@ -17,6 +17,23 @@
 # HOST OVERRIDES vs the community defaults:
 #   VLLM_ENABLE_PCIE_ALLREDUCE=0  b12x PCIe all-reduce collapses batch-1 decode
 #                                 here (v13 AND v14, measured) — NCCL instead.
+#   VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE=1 (2026-07-23) routes the MTP q_len=4
+#                                 verify batch through the sparse DECODE kernel
+#                                 instead of the extend/prefill path. festr
+#                                 measured CC1 127->160 tok/s and verified it
+#                                 lossless vs FlashInfer; the v20 image enables
+#                                 the fast path unconditionally. It is off by
+#                                 default in v19 (the in-tree comment still warns
+#                                 later verify rows must attend to earlier draft
+#                                 rows). We enable it on the v19 kernel and
+#                                 verified it OURSELVES: byte-comparison is
+#                                 impossible here (this server is not run-to-run
+#                                 deterministic even at temp=0/fixed seed), so
+#                                 correctness was judged on MTP acceptance rate,
+#                                 which moved 60.86%->60.70% (~0.4 sigma, i.e. no
+#                                 verifier corruption). Measured +8.9% decode at
+#                                 c1, ~-4% at c8/c16 (N=1, likely noise).
+#                                 See BENCHMARKS.md Phase 14. Set =0 to revert.
 #   L1=768GB RAM-only (~15M tokens @ 53.4KB/token; we have 2TB, weights need
 #                                 ~436GB page-cached so ~674GB slack remains —
 #                                 the last size where weight-cache eviction is a
@@ -90,6 +107,7 @@ docker run -d --name "$NAME" \
   -e VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-0}" \
   -e VLLM_DCP_QUERY_SPLIT="${VLLM_DCP_QUERY_SPLIT:-1}" \
   -e VLLM_B12X_MLA_CKV_GATHER="${VLLM_B12X_MLA_CKV_GATHER:-1}" \
+  -e VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE="${VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE:-1}" \
   -e DCP_PREFILL_WORKSPACE="${DCP_PREFILL_WORKSPACE:-auto}" \
   -e FUSE_ALLREDUCE="${FUSE_ALLREDUCE:-0}" \
   -e GLM52_ENABLE_LMCACHE=1 \
