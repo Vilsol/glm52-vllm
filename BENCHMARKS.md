@@ -787,3 +787,276 @@ at c16 the extra stream pushed past `MAX_NUM_SEQS=16` so a request queued, warmu
 stabilised, and the cell reported `∅ (16/16)` capacity-limited). The contaminated numbers
 (c1 64.6 vs 96.0 clean) looked exactly like a 33% regression. **Always gate a bench on
 `vllm:num_requests_running == 0` and re-check after** — a one-line guard that saves an hour.
+
+---
+
+# Phase 15 — r4 → r11, native LMCache (2026-07-27..29)
+
+## Image: `gilded-gnosis-v20-...-20260729-r11`, launcher `vllm-v20-r11.sh`
+
+r11 retires our entire hand-rolled LMCache stack. The image ships lmcache
+`0.5.2+glm52dcp.4` plus `/usr/local/bin/glm52-lmcache-wrapper.sh`, so the
+pip-install + 12-patch bootstrap, the v16 connector-injection patch, and
+`--disable-hybrid-kv-cache-manager` all became dead weight. Patches went 3 -> 1.
+
+**Why r11 and not r9:** r9 has a LMCache MP-server bug that hangs requests
+forever. `lmcache/v1/multiprocess/mq.py`, `_call_blocking_handler._notify_response`
+logged the exception and sent NOTHING, so the client future never completed and
+the vLLM request pinned in `WAITING_FOR_REMOTE_KVS` until engine restart. Fixed
+in r11 (`_queue_error_response`). **Our watchdog cannot see this failure mode** —
+`/health` returns 200 while an individual request hangs.
+
+## The GMU trap — booted healthy, died on the first real batch
+
+First r11 boot at the inherited GMU 0.96 came up green and then died:
+
+    torch.OutOfMemoryError: Tried to allocate 96.00 MiB.
+    GPU 6 ... 94.97 GiB total of which 89.25 MiB is free
+    (pynccl all_reduce -> torch.empty_like)
+
+Two r11 changes each ate headroom that 0.96 used to leave spare:
+1. exact indexer folding freed workspace, and **vLLM hands freed bytes straight
+   to KV cache** — 1,113,600 tokens vs r4's 990,592 at the SAME GMU. Our safety
+   margin silently became KV cache.
+2. the wrapper starts `--max-gpu-workers 8` LMCache GPU clients, ~0.7 GiB/GPU,
+   which our old 0.4.6 bootstrap never did.
+
+GMU 0.96 -> **0.94** gave 1,027,968 KV tokens (still above r4's 990,592) plus
+~1.9 GiB/GPU back. **A capacity gain at an unchanged GMU is the warning sign,
+not the win.**
+
+## First clean bench since 0724 (all cells CLEAN)
+
+| conc | r11 + LMCache | 0724 clean baseline | delta |
+|---|---|---|---|
+| 1  | 110.5 | 106.1 | +4.1% |
+| 4  | 312.3 | 314.8 | -0.8% |
+| 8  | 431.5 | 430.9 | +0.1% |
+| 16 | 634.7 | 617.4 | +2.8% |
+
+This settles the open question from Phase 14: **LMCache costs ~nothing in
+throughput.** The apparent "40% decode regression" on r4 was foreign traffic in
+the batch, which is why the driver now prints a per-cell CLEAN/CONTAMINATED
+verdict from `avg_running_reqs`.
+
+MTP acceptance: 68.72% lifetime (r4: 68.10%) — no regression. The 64.5% -> 61.3%
+"drift" seen in bench windows is an artefact of synthetic bench prompts.
+
+## Two upgrade traps defused (both still live in r20)
+
+- `DCP_CKV_GATHER_MAX_TOKENS` defaults to **140000**; we pin 524288 or every
+  prefill above ~140k drops to the slow fallback path.
+- The PCIe calibration is broken on our 4+4 SYS-split 2-NUMA topology
+  (misterfix hit it on identical `nvidia-smi topo -m`). Pinning all four
+  calibration knobs yields `calibration_status=skipped:all-explicit` and the
+  probe never runs.
+
+## Container-removal race
+
+`docker rm -f` returns before the name is released when 768 GB is pinned, so
+`docker run` lost the race with *"the container name /glm52 is already in use"*.
+This would also have broken the **watchdog's** restart path. The launcher now
+waits up to 120 s for the name to actually disappear.
+
+---
+
+# Phase 16 — r20 + the PCIe DMA campaign (2026-08-03)
+
+Production config changed for the first time since Phase 13. Headline: **+33%
+prefill at every context size**, decode flat, from size-gating the b12x PCIe
+collective and compressing its wire.
+
+## 0. THE COLD-RUN ARTIFACT — read this before trusting any older number
+
+**The first `llm_decode_bench` run after a boot measures warm-up, not the
+config.** Runs 2 and 3 of the same config agree to **<1%**.
+
+| ctx | cold penalty (candidate) | cold penalty (baseline) |
+|---|---|---|
+| 8k   | **-77%**  | -1.3% |
+| 64k  | **-37%**  | **-42%** |
+| 128k | -0.4%     | -1.7% |
+| 256k | -9.6%     | -7.4% |
+| 512k | -0.06%    | -0.1% |
+
+The first pass pays JIT compilation, CUDA-graph + FlashInfer autotune, and a
+cold page cache, and the penalty is **wildly context-dependent** — so it does
+not cancel when comparing two configs, it just adds a large variable error to
+whichever cell is most cold-sensitive.
+
+This retroactively explains the "64k anomaly" chased for an entire session (DMA
+regressed 64k, a query-split change fixed it, `ring` collapsed it) — 64k is
+simply the second most cold-sensitive cell. It also disproves the assumed "~7%
+noise floor": real warm reproducibility is 0.1-0.9%.
+
+**Every prefill number in this file recorded before 2026-08-03 is a cold single
+sample and is NOT comparable to a warm one.** `run-r20-verify-bench.sh` now runs
+a discarded warm-up pass first (`SKIP_WARMUP=1` defeats it).
+
+## 1. The probe is a supported deployment preflight — use it
+
+`sparkinfer.comm.pcie.overlap_probe` must run with the GPUs EMPTY. It measures
+the collective directly, and upstream anticipates exactly this tuning
+(`custom_all_reduce.py:531`: *"A deployment preflight can tune its crossover or
+disable it when lossless DMA never beats NCCL on the selected PCIe topology"*).
+
+    torchrun --standalone --nproc-per-node=8 \
+      -m sparkinfer.comm.pcie.overlap_probe \
+      --tp-size 8 --dcp-size 2 --indexer-shards 1 --active-iterations 15
+
+(`--indexer-shards 0` is rejected — it must divide tp and dcp; pass 1.)
+
+TP all-reduce, lossless BF16, fine sweep (payload = rows x 6144 x 2 bytes):
+
+| rows | bytes | nccl_ms | dma_ms | gain |
+|---|---|---|---|---|
+| 1     | 12288     | 0.075 | 0.445 | **-490.9%** |
+| 512   | 6291456   | 0.488 | 1.000 | -104.8% |
+| 1536  | 18874368  | 1.097 | 1.143 | -4.2% |
+| 2048  | 25165824  | 1.483 | 1.815 | -22.4% |
+| 2560  | 31457280  | 1.820 | 1.679 | +7.7% |
+| 4096  | 50331648  | 2.896 | 2.474 | +14.6% |
+| 8192  | 100663296 | 5.702 | 4.614 | **+19.1%** |
+
+Below ~2560 rows the band is **non-monotonic noise** (NCCL protocol switching);
+the probe's own `dma_min_bytes` recommendation came back as 0, 25165824 and
+31457280 on three runs. Do not trust a single recommendation. Above 2560 it is
+clean and monotonic, and 8192 rows reproduced at +19.5%/+19.1%.
+
+Larger payloads **plateau** — 12288 rows +20.8%, 16384 +20.7%, 32768 +20.2% —
+which is why `MAX_BATCHED_TOKENS=16384` was rejected without spending a boot.
+
+Also reconfirmed by probe: `DCP_CKV_PREFETCH_DEPTH=1` is correct (+4.0% to
++16.9% overlap benefit across 8 context sizes; depth 0 would COST that).
+
+## 2. Production change — size-gate the collective, compress the wire
+
+vLLM dispatches TP all-reduce three ways (`custom_all_reduce.py`):
+
+    payload <= VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE  -> b12x ONESHOT
+    payload >= VLLM_PCIE_DMA_MIN_BYTES               -> b12x DMA
+    everything else                                  -> PyNCCL
+
+Our traffic is **bimodal with nothing in between**: decode is 1-4 rows (12-48
+KiB), prefill is always 8192 rows (96 MiB) regardless of prompt length — a long
+prompt just means *more* chunks, not bigger ones.
+
+**The historical batch-1 decode collapse to ~40 tok/s was the ONESHOT path, not
+DMA.** A 12 KiB decode payload sits under the image's 64 KB oneshot limit, so DMA
+never engaged there at all. Disabling the whole PCIe path to fix decode also
+discarded the prefill DMA win for a year. Gating by size keeps both.
+
+New production defaults in `vllm-v20-r20.sh`:
+
+    VLLM_ENABLE_PCIE_ALLREDUCE=1
+    PCIE_ONESHOT_MAX=0  PCIE_ONESHOT_FUSED_MAX=0   (oneshot OFF -> decode on NCCL)
+    GPU_MEMORY_UTILIZATION=0.93
+    DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS=49152
+    F8_DMA=i8_ring
+
+The two oneshot limits are hardcoded at `glm52-pcie-runtime-env.sh:14-15`, so a
+`docker -e` cannot reach them — patch 4 makes them env-overridable.
+
+## 3. Warm results (medians of 2 warm runs)
+
+| ctx | baseline PyNCCL | new config | delta |
+|---|---|---|---|
+| 8k   | 4,026 | 5,334 | **+32.5%** |
+| 64k  | 4,184 | 5,676 | **+35.6%** |
+| 128k | 4,168 | 5,613 | **+34.7%** |
+| 256k | 4,053 | 5,366 | **+32.4%** |
+| 512k | 3,774 | 4,875 | **+29.2%** |
+
+| conc | baseline | new | delta |
+|---|---|---|---|
+| 1  | 109.6 | 105.0 | -4.2% |
+| 4  | 308.8 | 301.4 | -2.4% |
+| 8  | 430.4 | 431.2 | +0.2% |
+| 16 | 627.9 | 621.6 | -1.0% |
+
+Uniform +29..36% across every context is exactly what the mechanism predicts.
+For long-context coding the trade is ~35:1 in time: a 256k prefill goes 63s ->
+48s; a 1000-token reply loses 0.4s. The c1 decode cost is likely per-call
+dispatch overhead from having the b12x path active (decode still routes to
+PyNCCL in both configs).
+
+**`F8_DMA=i8_ring` carries almost all of it.** DMA with `F8_DMA=0` measured only
+**+2.7%** mean. Compression halves the bytes crossing PCIe on a PCIe-bound box,
+which dominates the DMA-vs-NCCL algorithmic difference. Do NOT "play it safe"
+with `F8_DMA=0` — that keeps the quality cost and discards the speed.
+
+Note `F8_DMA` was a **no-op for us before this change**: `custom_all_reduce.py`
+reads `VLLM_PCIE_DMA_FP8` only inside the DMA branch, which never executed while
+`VLLM_ENABLE_PCIE_ALLREDUCE=0`.
+
+## 4. Measuring quality without a BF16 reference — `measure-kld.sh`
+
+The published KLD table is vs BF16, which we cannot run (~1.5 TB). But
+`F8_DMA=0` and `i8_ring` are **identical weights and quantization** — only the
+wire format differs — so the PyNCCL config is a valid LOCAL reference and the
+delta is exactly the cost of the change. Uses `prompt_logprobs=20` over ~8k-token
+prompts (**they must be >=2048 tokens or the DMA path never engages and the
+harness reports a spurious zero**).
+
+vs the PyNCCL baseline, 27,495 token positions:
+
+| config | mean KL | top-1 agreement | **confident** flips (>1 nat) |
+|---|---|---|---|
+| DMA, no compression | 0.009878 | 95.006% | **13** (0.047%) |
+| DMA + `i8_ring`     | 0.011147 | 94.315% | **15** (0.055%) |
+| DMA + `ring`        | 0.015367 | 93.850% | **33** (0.120%) |
+
+Raw flip counts (~6%) are **misleading**: median reference margin at a flipped
+position is 0.125 nats (a coin toss) vs 3.750 nats where the choice held, and
+~36% of flips are outright near-ties. Weighted by confidence the change is
+0.055%. `i8_ring` adds ~2 confident flips over uncompressed DMA — inside Poisson
+noise — while carrying all the speed. **`ring` is dominated** (33 vs 15 at
+identical speed): do not use it. timricese's hedged guess that `i8_ring` is the
+gentler variant is confirmed.
+
+**Caveat — generation diverges.** Greedy outputs vs the old config split within
+6-41 tokens and share only 5-22% of a 256-token sequence, consistent with the
+per-token flip rate compounding autoregressively. Each config is self-consistent
+going forward, but nothing captured before the cutover reproduces. Divergence is
+not degradation (a flip at a near-tie is arbitrary), but we have **no task-level
+eval** on this box and cannot claim quality is unchanged.
+
+## 5. Rejected, with numbers
+
+- **DCP4** — -1.2..-3.9% prefill, **-5.4..-10.9% decode** (worst at c16, exactly
+  where subagent fan-out lives) for +92% KV capacity (1,912,064 vs 996,480). Not
+  worth it: LMCache L1 already backstops KV pressure from host RAM. Confirms the
+  Phase 13 DCP2 choice, this time warm.
+- **`MAX_BATCHED_TOKENS=16384`** — probe showed the DMA gain plateaus at ~20.5%
+  past 8192; only +2.4pp for real VRAM cost.
+- **`SPARKINFER_INDEXER_TWO_LEVEL_FOLD=off`** — +30.5% vs +32.9% mean; folding is
+  neutral-to-slightly-positive. Keep `auto`.
+- **`/dev/shm` hugepages** — premise does not apply. Our L1 is anonymous mmap
+  already backed by THP (`AnonHugePages: 841 GB`, LMCache RSS 807 GB); `/dev/shm`
+  holds 1.25 GB. `VmLck: 0` — the L1 is resident, not pinned.
+- **native `OffloadingConnector`** — never booted, 3 attempts. Needs
+  `expandable_segments:False`; that costs allocator efficiency and OOMs when
+  stacked with the b12x path at working GMU. **Not a drop-in fallback if LMCache
+  misbehaves** — it needs its own memory tuning.
+
+## 6. Traps found in our own tooling
+
+- **`LMCACHE_MODE=off` silently disables the allocator fix.** The wrapper forces
+  `expandable_segments:False` at lines 143-150, but with LMCache off it
+  `exec "$@"` at **line 13** and never gets there, so `serve-glm52-v16.sh:51`'s
+  single-dash `${VAR-default}` reasserts `expandable_segments:True`. The launcher
+  now has a conditional `PYTORCH_CUDA_ALLOC_CONF` passthrough.
+- **LMCache MP registration races a hardcoded 60 s timeout.** At TP8 the server
+  registers workers serially at ~8.6 s each; the 8th finished at **62.4 s** and
+  the client had already given up. The wrapper is byte-identical on r11 and r20,
+  so **every boot has been winning this by ~2 s**. Patch 3 makes
+  `lmcache.mp.mq_timeout` env-overridable; we set 600.
+- **Never point `CACHE_ROOT` at a cold NFS directory.** An empty JIT cache makes
+  all 8 workers Triton-compile at once and NFS returned
+  `OSError: [Errno 121] Remote I/O error`, taking the boot down.
+- Bench-driver gates needed fixing: the KV ceiling now scales with DCP (a healthy
+  DCP4 boot was aborted as an "OOM signature"), and the free-VRAM floor accepts
+  `ALLOW_WARM_VRAM=1` (PyTorch's caching allocator retains blocks, so a warm
+  re-bench reads ~1 GiB where boot showed ~3.6 GiB).
+- `GPU_MEMORY_UTILIZATION=0.90` is **below the floor**: 917,504 tokens needs
+  23.38 GiB of KV and 0.90 leaves 22.66 GiB. Engine refuses to start.

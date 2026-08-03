@@ -13,12 +13,19 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 NAME=glm52
 URL=http://127.0.0.1:8443/health
-LAUNCH="bash /root/glm52-vllm/vllm-v19-lmcache.sh"   # current production (v19/DCP2/LMCache/CKV)
+LAUNCH="bash /root/glm52-vllm/vllm-v20-r20.sh"   # v20 r20 + NATIVE LMCache (production 2026-08-03)
+# Rollback to the previous production stack is one line:
+#   LAUNCH="bash /root/glm52-vllm/vllm-v20-r11.sh"        # r11 (image still on disk)
+#   LAUNCH="bash /root/glm52-vllm/vllm-v20-lmcache.sh"    # r4 + hand-rolled LMCache
+#
+# NOTE: this watchdog CANNOT detect the LMCache stall that r11 fixes (a hung
+# request leaves /health returning 200). If requests hang but health is green,
+# suspect the KV connector, not the engine — check for WAITING_FOR_REMOTE_KVS.
 LOG=/root/glm52-vllm/watchdog.log
 
 CHECK_INTERVAL=15     # seconds between health probes
 FAIL_THRESHOLD=4      # consecutive failures (~60s) before acting
-BOOT_GRACE=1800       # after a (re)start, allow this long to boot before force-restart
+BOOT_GRACE=2700       # LMCache cold boot is ~25-30min (768GB L1 pin evicts weight page cache -> NFS reload)
 MAX_RESTARTS=3        # max restarts within RESTART_WINDOW before giving up
 RESTART_WINDOW=3600
 
