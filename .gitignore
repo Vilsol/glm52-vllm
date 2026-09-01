@@ -15,6 +15,11 @@
 #     byte-comparison it performs is invalid on this stack today, but the harness
 #     is kept for if/when batch-invariant kernels make it meaningful)
 !spec-extend-lossless-check.py
+# 2d) bench contamination filter: llm-inference-bench does NOT detect external
+#     traffic during a decode cell (it only flags UNDER-filled cells), so on a
+#     live box a cell someone else's request landed in is silently wrong. This
+#     applies the missing rule. See BENCHMARKS.md Phase 18 s9.
+!agg-clean-cells.py
 
 # 3) re-include launcher dependency dirs + the files they need
 #    (tool-call parser patch, and the LMCache mount scripts/patches)

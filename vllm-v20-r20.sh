@@ -263,12 +263,140 @@ IMAGE="${IMAGE:-voipmonitor/vllm:gilded-gnosis-v20-vllm72c35f1-si2b9bf2a-fi801d5
 NAME="${NAME:-glm52}"
 PORT="${PORT:-8443}"
 TP="${TP:-8}"
-DCP="${DCP:-2}"
+# DCP 2 -> 4 (2026-08-31, MEASURED — the full ladder was benched on this host):
+#
+#   config   KV pool     pool/ctx   c1 steps/s  c4     c8     prefill 128k
+#   DCP2       868,352     1.02x        38.6   107.6  153.0        5,576
+#   DCP4     1,706,495     2.00x        37.2   100.2  140.0        5,487
+#   DCP8     3,363,328     3.95x        19.7    24.5   26.1            -
+#
+# DCP4 costs ~3-8% decode and ~2% prefill to DOUBLE the pool. It took
+# preemptions from 15 (accumulated on DCP2) to ZERO across a full bench battery,
+# and preemption is a total loss — scheduler.py frees every KV block and sets
+# num_computed_tokens=0, and LMCache refuses PREEMPTED requests outright. One
+# avoided preemption of a 150k prompt is worth far more than 5% decode.
+#
+# My Phase 8 note predicted DCP4 would HALVE prefill. It did not (5,487 vs
+# 5,576). That note was DCP4-vs-DCP1 on the June v11 image, before r20's CKV
+# gather. Old topology numbers on this box go stale — re-measure, don't assume.
+#
+# DCP8 IS A TRAP and this is now measured twice (v19 2026-07-21, r20 2026-08-31).
+# Decode collapses ~5.2x at c8 and barely scales with concurrency (19.7 -> 24.5
+# -> 26.1 steps/s for 1 -> 4 -> 8 requests): every decoded token needs an 8-way
+# all-reduce across our PCIe-only 2-NUMA fabric (GPU0-3 / 4-7) and that dominates.
+# MTP acceptance was FINE at DCP8 (2.77-2.81), which rules out speculation and
+# points squarely at the collective. r20's CKV gather + 4-way indexer sharding
+# did NOT move it, though they clearly fixed DCP4. Do not retry without a
+# topology change (NVLink / single NUMA).
+#
+# DCP must DIVIDE TP, so at TP8 the only legal values are 1, 2, 4, 8. DCP=6 is
+# not available here — the Discord "dcp6" reports are all TP6/DCP6 (six GPUs
+# total), which idles 2 of our 8 and raises per-GPU weight bytes; their measured
+# pools were 774k and 999k, BELOW our DCP4.
+DCP="${DCP:-4}"
 MTP="${MTP:-3}"
 MOE_MODE="${MOE_MODE:-a16}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-917504}"     # 256-aligned (block64*dcp2*2)
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
+# GLM-5.3 CUT THIS FROM 917504 -> 851968 (2026-08-28). Measured, not estimated:
+# 5.3's BF16 MTP layer costs +2.82 GiB/GPU (not the +1.62 that pure /8 sharding
+# predicts — part of layer 78 replicates), so at GMU 0.93 available KV fell
+# 25.43 -> 22.61 GiB. KV costs 26.72 KiB/token here, so 22.61 GiB tops out at
+# 887,286 tokens and vLLM refused to boot at 917,504 (needs 23.38 GiB):
+#   ValueError: ... 23.38 GiB KV cache is needed ... available 22.61 GiB
+# 851,968 leaves ~4% margin. To get 917,504 back you would need GMU 0.94, which
+# yields 924,555 — only 0.8% over the requirement AND sits exactly on the OOM
+# ceiling documented above (768GB L1). Not worth it: a boot-time refusal is
+# cheap, an OOM under load is not. Other lever: DCP_CKV_GATHER_MAX_TOKENS.
+# 851,968 -> 1,048,576 (2026-08-31), restored to 1M by the DCP4 pool doubling.
+# Alignment at DCP4 is block64*dcp4*2 = 512; 1,048,576 / 512 = 2048 exactly.
+# At the measured 1,706,495-token DCP4 pool that is 1.63x pool/ctx — inside the
+# 1.5-3x band (daring_hare, 06-30) and up from the 1.02x that was preempting.
+# GATE ON BOOT: "GPU KV cache size" must exceed 1,048,576 or the engine refuses
+# to start. If it lands short, drop back to 917,504 rather than raising GMU —
+# 0.93 OOM'd twice on 5.3 (see the GPU_MEMORY_UTILIZATION block).
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"    # 512-aligned (block64*dcp4*2)
+# 16 -> 8 on 2026-08-31: the scheduler was ADMITTING more long-context sessions
+# than the KV pool can hold, so it preempted them mid-generation.
+#
+# MEASURED 2026-08-29 06:44 (54h window, GLM-5.3, GMU 0.925):
+#   vllm:num_preemptions_total   0 -> 6   in a single burst
+#   max vllm:kv_cache_usage_perc 1.00     (pool 100% full)
+#   max vllm:num_requests_running   5     <- only FIVE concurrent did it
+#
+# Preemption is not a stall, it is a total loss. scheduler.py:1235-1248:
+#   self._free_request_blocks(request)     # every KV block freed
+#   request.num_computed_tokens = 0        # everything computed is discarded
+#   self.waiting.prepend_request(request)
+# The request restarts from zero, which presents as "one agent suddenly hit
+# prefill mid-run" while others keep decoding. LMCache CANNOT rescue it: the
+# connector returns (0, False) for PREEMPTED before it even looks up
+# (lmcache_mp_connector.py:1029-1031, "TODO: support loading KV for preempted
+# requests in the future"). Upstream fix is LMCache PR #4612, still OPEN and
+# blocked on store-ordering safety (PR #4836, opened by yatesdr/D-Rock
+# 2026-08-31) -- taking #4612 alone risks cache poisoning, so we wait.
+#
+# Pool arithmetic at 868,352 tokens: 2 sessions -> 434k each, 3 -> 289k,
+# 4 -> 217k, 5 -> 174k, 6 -> 145k. Five agentic sessions at ~170k exhausts it
+# exactly, which is what the counters recorded. 8 is a compromise: it still
+# admits more than the pool comfortably holds at 170k/session, but queueing
+# costs latency whereas preemption costs the ENTIRE prefill.
+# If preemptions persist, go to 6, then 5. Watch vllm:num_preemptions_total.
+#
+# NOTE the community does not hit this: their pasted logs show Waiting: 0 and
+# GPU KV usage median 9.6%/max 26.3% (n=10), and "preempt" appears 0 times in
+# 11,159 Discord messages. Our pool/ctx is 1.02x; the folk rule is 1.5-3x.
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+# CHAT TEMPLATE KWARGS — overrides the image preset at serve-glm52-v16.sh:411,
+# which hardcodes '{"reasoning_effort":"high"}'. argparse keeps the LAST
+# occurrence and REPLACES (does not merge), so passing this drops the preset's
+# value entirely. Two effects, both wanted:
+#
+#   1. reasoning_effort disappears -> chat_template.jinja:2 falls through to
+#      'max'. The preset was pinning us to High; Max is the template default.
+#        {%- set effective_reasoning_effort =
+#             'high' if reasoning_effort is defined and reasoning_effort == 'high'
+#             else 'max' -%}
+#
+#   2. clear_thinking=false keeps <think> blocks for ALL prior assistant turns.
+#      DEFAULT BEHAVIOUR IS A PREFILL DISASTER FOR AGENTIC CODING: the template
+#      retains reasoning only while a turn is AFTER the last user message
+#      (chat_template.jinja:70). During a tool-calling chain last_user_index is
+#      pinned at the original prompt, so every assistant turn keeps its <think>
+#      and gets prefilled+cached that way. The moment the user replies,
+#      last_user_index jumps to the end and EVERY turn in the chain collapses to
+#      <think></think> at once -> the rendered prefix diverges at the FIRST
+#      assistant turn of the chain -> total cache miss -> full re-prefill.
+#
+#      Measured 2026-08-07 on this box, same conversation, same cache:
+#        prime chain X            27,475 prompt / 27,264 cached (99.2%)
+#        X + user reply, DEFAULT   9,331 prompt /      0 cached ( 0.0%)  <-- !!
+#        X + user reply, CT=false 27,487 prompt / 27,264 cached (99.2%)
+#      The DEFAULT prompt is SMALLER because 18,144 tokens of reasoning were
+#      deleted; that deletion is exactly why it no longer matches.
+#
+#      Symptom this fixes: "agent finishes and asks a question, I answer, then
+#      it takes minutes before the response starts" — the delay is the whole
+#      chain re-prefilling at ~5,300 tok/s, and it scales with chain length.
+#      It is NOT LMCache eviction; the blocks are resident but unreachable.
+#
+# COST: prompts carry their reasoning, so contexts grow faster against
+# MAX_MODEL_LEN and L1 entries are bigger. Left LMCACHE_L1_GB at 768 on purpose
+# (2026-08-07) — revisit if L1 usage_ratio sits above the 0.90 evict watermark.
+# Set CHAT_TEMPLATE_KWARGS='' to fall back to the image preset.
+#
+# ON GLM-5.3 (weights-only successor, SAME arch — see MODEL_HOST below):
+#   zai-org/GLM-5.3 rewrote the template header and fixed effect 2 upstream:
+#     {%- set clear_thinking = clear_thinking if clear_thinking is defined
+#           else false -%}
+#   so prior-turn reasoning is RETAINED by default and this override becomes
+#   redundant for that purpose. Its ONLY remaining effect on 5.3 is dropping
+#   the preset's reasoning_effort -> Max. 5.3 also accepts 'low' (5.2 accepted
+#   only 'high'; anything else -> 'max') and no longer honours enable_thinking.
+#   Verified 2026-08-28 by rendering the real 5.3 template. NOTE the 5.3
+#   template uses {% break %} and needs jinja2.ext.loopcontrols — a bare
+#   jinja2.Environment() raises "unknown tag 'break'". Transformers supplies
+#   it, so serving is unaffected; our own render-the-template tooling is not.
+CHAT_TEMPLATE_KWARGS="${CHAT_TEMPLATE_KWARGS-{\"clear_thinking\":false\}}"
 # 0.94, NOT the 0.96 we ran on r4. First r11 boot at 0.96 came up healthy and
 # then died on the first real batch (2026-07-29 22:53) with:
 #   torch.OutOfMemoryError: Tried to allocate 96.00 MiB. GPU 6 has 94.97 GiB
@@ -304,7 +432,31 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 # on exactly 0.94 with a 512GB L1; sininspira OOM'd at 0.95 with ~90 MB of
 # margin, specifically during a 128k prefill. We run a LARGER L1 (768GB) than
 # either, so 0.94 is a CEILING here, not a floor.
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.93}"
+# 2026-08-29: CUT 0.93 -> 0.925 AFTER A PRODUCTION OOM ON GLM-5.3.
+# At 23:52:42 on 2026-08-28, after 3h40m healthy at GMU 0.93, all 8 workers died:
+#   MemoryError: CUDA out of memory. Tried to allocate 1.48 GiB.
+#   GPU N has a total capacity of 94.97 GiB of which 1.41 GiB is free.
+#   ... this process has 91.35 GiB memory in use.
+# Allocation site was speculator.propose() (the MTP=3 draft path), 5 reqs running.
+# Missed by 70 MiB. The API server caught EngineDeadError and exited 0, so docker
+# reported a CLEAN exit -- this does NOT look like a crash from outside.
+#
+# Why 0.93 was not enough on 5.3 (it ran 3 weeks on 5.2): 5.3's BF16 MTP layer
+# raised PROFILED peak activation 2.25 -> 3.49 GiB/GPU, and the profile is taken
+# under a synthetic boot run. Real concurrency + MTP3 overshoots it: the process
+# reached 91.35 GiB against an 88.32 GiB budget, i.e. 3.03 GiB of transients
+# living OUTSIDE the KV budget. Non-budget headroom is (1-GMU)*94.97, so it is
+# the ONLY knob here that trades KV for transient safety.
+#   0.930 -> 6.65 GiB headroom, KV 886,912 tok (ctx margin 4.1%)  <- OOM'd
+#   0.925 -> 7.12 GiB headroom, KV 868,285 tok (ctx margin 1.9%)
+# 0.925 would have left ~1.88 GiB free at the OOM instant vs the 1.48 GiB ask.
+#
+# WATCH ON NEXT BOOT: "GPU KV cache size" must exceed 851,968. Predicted ~868k,
+# margin only 1.9% -- if it lands short the engine refuses to start (loudly).
+# If that happens, drop MAX_MODEL_LEN to 819200 rather than raising GMU back.
+# If it OOMs again at 0.925, prefer MAX_BATCHED_TOKENS 8192->4096 (targets the
+# prefill activation peak directly, costs no context) over cutting GMU further.
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.925}"
 F8_DMA="${F8_DMA:-i8_ring}"   # compressed DMA wire: carries ~all of the +33%
 PCIE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"      # 1 = b12x, size-gated (see PCIE BLOCK)
 # b12x oneshot dispatch limits (patch 4). Image defaults 64KB/84KB are kept;
@@ -376,7 +528,56 @@ if [[ "${LMCACHE_MODE,,}" == "disk" ]]; then
   exit 1
 fi
 
-MODEL_HOST="${MODEL_HOST:-$(echo /root/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/snapshots/*/ )}"
+# GLM-5.3 IS A DROP-IN HERE. It is a weights-only successor: config.json is
+# dimension-for-dimension identical to GLM-5.2 (GlmMoeDsaForCausalLM, 78 layers,
+# hidden 6144, 64 heads, moe_intermediate 2048, 256 routed experts, 8 per token,
+# vocab 154880, 1,048,576 ctx, num_nextn_predict_layers 1 so MTP is present).
+# Verified 2026-08-28. No new image is needed — override MODEL_HOST and reboot.
+#   MODEL_HOST=/root/.cache/huggingface/hub/models--<repo>/snapshots/<rev> \
+#     bash vllm-v20-r20.sh
+# Re-derive GPU_MEMORY_UTILIZATION anyway if the quant recipe differs from
+# lukealonso's 5.2 (weights bytes/GPU drive the KV residual), and re-read the
+# CHAT_TEMPLATE_KWARGS block above — 5.3 changed the template defaults.
+# Do NOT grab local-inference-lab/GLM-5.3-NVFP4: despite the name it is
+# Glm5NextForConditionalGeneration (GLM-5.3-*Flash*, 185.7 GiB, vision tower),
+# not this architecture. Community big-5.3 NVFP4s are ~432.9 GiB.
+# --- ACTIVE: GLM-5.3 (RadixArk NVFP4) since 2026-08-28 -----------------------
+# Chosen over incoai (quantized from the zai-org/GLM-5.3 *FP8* release, i.e.
+# NVFP4-on-FP8) and Inferact (no published accuracy, 99.99-pct activation-scale
+# clipping). RadixArk is the only one publishing parity vs its own BF16 source
+# on an identical build (GSM8K 1285/1319 exact match; AIME 2026 94.17%), and its
+# quantization_config has the same shape as lukealonso 5.2 (config_groups +
+# wildcard ignore + producer modelopt). Verified on disk: 47/47 shards,
+# 464,795,267,072 tensor bytes == index total_size, layer 78 (MTP) fully BF16.
+#
+# WEIGHT DELTA vs 5.2 — the ONLY category that changed is the MTP layer:
+#   routed experts 379.69 GiB, attention 24.34, embed/lm_head 3.54 : IDENTICAL
+#   MTP layer 78:  5.60 GiB (luke quantized it) -> 18.54 GiB (RadixArk BF16)
+#   => +12.94 GiB total; MTP experts shard across TP, so +12.94/8 = +1.62 GiB/GPU
+#   => weights/GPU 58.82 -> ~60.44 GiB.  GMU left at 0.93: the +1.62 is absorbed
+#      by KV, projecting ~965k tokens (was 997,631) — still over the 917,504
+#      floor. 0.94 would restore ~1.00M but spends 0.95 GiB/GPU of OOM headroom
+#      at a value documented above as a CEILING at our 768GB L1. A boot that
+#      lands under the floor fails LOUDLY; an OOM at 0.94 fails under load.
+#      If the printed "GPU KV cache size" is < 917,504, raise to 0.94 and reboot.
+# ACTIVE 2026-08-31: local-inference-lab (Luke's) GLM-5.3-NVFP4.
+# Switched from RadixArk after drock's 64-window KLD matrix (2026-08-30) measured
+# LIL NVFP4 + FP8 KV at 0.02071 overall — "recommended start", second only to
+# official FP8 (0.01968), and TP8-tagged. RadixArk was never in that matrix; we
+# had picked it on GSM8K/AIME parity, which is far coarser. Luke's producer is
+# modelopt 0.39.0.dev290, the SAME version as his GLM-5.2 quant that ran here for
+# weeks. Verified on disk: 85 index shards + 2 amax files, on-disk bytes ==
+# index total_size exactly (note LIL counts safetensors headers in total_size
+# where RadixArk did not; tensor payload is identical to the byte), layer 78
+# (MTP) fully BF16, routed experts U8 + F8_E4M3 + F32.
+MODEL_HOST="${MODEL_HOST:-/root/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-NVFP4/snapshots/cca10d1586255195d3279785fc85577bfc1e9227}"
+# ROLLBACK to RadixArk 5.3 (still on disk, 432.9 GiB, ran 08-29..31 without fault):
+#   MODEL_HOST=/root/.cache/huggingface/hub/models--RadixArk--GLM-5.3-NVFP4/snapshots/363e8f086905afd83db356a620f9aa401c23800a bash vllm-v20-r20.sh
+# GLM-5.2 was DELETED 2026-08-31 to make room; re-download if ever needed.
+# ROLLBACK to GLM-5.2 (unchanged, still on disk, 436 GiB):
+#   MODEL_HOST="$(echo /root/.cache/huggingface/hub/models--lukealonso--GLM-5.2-NVFP4/snapshots/*/)" bash vllm-v20-r20.sh
+# NOTE: SERVED_MODEL_NAME stays "GLM-5.2" on purpose so existing client configs
+# keep working; the API will report id "GLM-5.2" while serving 5.3 weights.
 MODEL_HOST="${MODEL_HOST%/}"
 [[ -f "${MODEL_HOST}/config.json" ]] || { echo "ERROR: model snapshot not found" >&2; exit 1; }
 
@@ -510,6 +711,56 @@ assert s.count(old) == 1, f"expected exactly 1 mq_timeout line, found {s.count(o
 open(p, "w").write(s.replace(old, new))
 PYPATCH
 grep -qF 'LMCACHE_MQ_TIMEOUT' "$WRAP_OUT" || { echo "FATAL: mq_timeout patch did not apply" >&2; exit 1; }
+
+# --- L1 EVICTION BLAST RADIUS (patch 6, added 2026-08-31) -------------------
+# The wrapper hardcodes the eviction knobs, so a `docker -e` cannot reach them.
+#
+# MEASURED over the 2026-08-29..31 weekend (54h, GLM-5.3, L1=768GB):
+#   l1_evicted_chunks_total          10,594
+#   l1_eviction_loop_triggered_total      2      <- only TWICE
+# i.e. each trigger dumped 5,298 chunks = 2.71M tokens = ~82 GB IN ONE EVENT,
+# because eviction_ratio 0.10 discards 10% of the whole cache at once, by LRU.
+# LRU victims are exactly the PAUSED agentic sessions whose owner is about to
+# come back -- so a resume that should have been a warm restore becomes a full
+# re-prefill. Confirmed by LMCache's own histogram:
+#   l1_chunk_evict_reuse_gap_seconds: count=110, all <=500s, mean 300s
+# i.e. 110 chunks were evicted and needed again within ~5 minutes.
+# Event #2 landed 2026-08-31 08:54, ~6 min before a user reported exactly this.
+#
+# Between events L1 idles at 82-86%, which LOOKS like headroom -- that is why
+# this reads as "full prefill even though LMCache is not full". It is full: it
+# reached the 0.90 watermark on 08-29 15:07 and has sat at the ceiling since.
+#
+# 0.10 -> 0.02 cuts the blast radius 5x (~82 GB -> ~16 GB per event); evictions
+# become more frequent and much gentler. 0.90 -> 0.94 reclaims ~33 GB of usable
+# cache before the first trigger. Neither enlarges L1: the working set genuinely
+# exceeds 768 GB (L1 went 10% -> 90% in twelve hours), so if re-prefills persist
+# the next lever is LMCACHE_L1_GB (host shows ~1,043 GB available), not these.
+WRAP_EV_WM='  --eviction-trigger-watermark 0.90'
+WRAP_EV_RATIO='  --eviction-ratio 0.10'
+for lit in "$WRAP_EV_WM" "$WRAP_EV_RATIO"; do
+  grep -qF -- "$lit" "$WRAP_OUT" || {
+    echo "FATAL: '$lit' not found in $WRAP_SRC — upstream changed the eviction knobs." >&2
+    echo "       Re-read the wrapper before assuming the blast-radius fix applied." >&2
+    exit 1; }
+done
+python3 - "$WRAP_OUT" <<'PYPATCH'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+for old, new in (
+    ('  --eviction-trigger-watermark 0.90\n',
+     '  --eviction-trigger-watermark "${LMCACHE_EVICT_WATERMARK:-0.94}"\n'),
+    ('  --eviction-ratio 0.10\n',
+     '  --eviction-ratio "${LMCACHE_EVICT_RATIO:-0.02}"\n'),
+):
+    assert s.count(old) == 1, f"expected exactly 1 of {old!r}, found {s.count(old)}"
+    s = s.replace(old, new)
+open(p, "w").write(s)
+PYPATCH
+grep -qF 'LMCACHE_EVICT_WATERMARK' "$WRAP_OUT" || { echo "FATAL: evict watermark patch did not apply" >&2; exit 1; }
+grep -qF 'LMCACHE_EVICT_RATIO'     "$WRAP_OUT" || { echo "FATAL: evict ratio patch did not apply" >&2; exit 1; }
+
 chmod +x "$WRAP_OUT"
 
 # Tearing down the previous container is NOT instant: with ~768 GB of pinned
@@ -518,6 +769,34 @@ chmod +x "$WRAP_OUT"
 # "Conflict. The container name /glm52 is already in use" (hit 2026-07-29).
 # That would also break the watchdog, which calls this script to restart. Wait
 # for the name to actually disappear.
+# --- PRESERVE THE OUTGOING CONTAINER'S LOGS BEFORE DESTROYING IT -----------
+# `docker rm -f` deletes /var/lib/docker/containers/<id>/*-json.log along with
+# the container, so every restart used to destroy the evidence for the very
+# failure that triggered it. That bit us on 2026-08-28: the engine OOM'd in
+# speculator.propose(), the watchdog restarted, and the log had to be salvaged
+# by hand before it was gone. Capture first. Capture must NEVER block or fail a
+# restart, hence timeouts and `|| true` throughout.
+CRASHLOG_DIR="${CRASHLOG_DIR:-/root/glm52-vllm/crashlogs}"
+CRASHLOG_KEEP="${CRASHLOG_KEEP:-30}"
+if [[ "${CRASHLOG_CAPTURE:-1}" == "1" ]] && docker inspect "$NAME" >/dev/null 2>&1; then
+  mkdir -p "$CRASHLOG_DIR"
+  _ts=$(date -u +%Y%m%dT%H%M%SZ)
+  _cid=$(docker inspect -f "{{.Id}}" "$NAME" 2>/dev/null | cut -c1-12)
+  _ec=$(docker inspect -f "{{.State.ExitCode}}" "$NAME" 2>/dev/null)
+  _st=$(docker inspect -f "{{.State.Status}}" "$NAME" 2>/dev/null)
+  _oom=$(docker inspect -f "{{.State.OOMKilled}}" "$NAME" 2>/dev/null)
+  _base="$CRASHLOG_DIR/${_ts}-${_cid:-unknown}-${_st:-unknown}-exit${_ec:-x}"
+  timeout 60  docker inspect "$NAME" >"${_base}.inspect.json" 2>/dev/null || true
+  timeout 300 docker logs    "$NAME" >"${_base}.log"          2>&1 || true
+  # the LMCache MP server logs inside the container /tmp, which is not mounted
+  timeout 60  docker cp "$NAME:/tmp/lmcache-mp-${PORT}.log" "${_base}.lmcache.log" >/dev/null 2>&1 || true
+  echo "  saved logs -> ${_base}.log ($(du -h "${_base}.log" 2>/dev/null | cut -f1)) status=$_st exit=$_ec oomkilled=$_oom"
+  # retention: keep the newest $CRASHLOG_KEEP of each kind
+  for _pat in "*.log" "*.inspect.json" "*.lmcache.log"; do
+    ls -1t "$CRASHLOG_DIR"/$_pat 2>/dev/null | tail -n +$((CRASHLOG_KEEP+1)) | xargs -r rm -f
+  done
+fi
+
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 for _ in $(seq 1 60); do
   docker inspect "$NAME" >/dev/null 2>&1 || break
@@ -535,7 +814,15 @@ fi
 # env) and its CMD defaults to run-kimi26-vllm, which just prints "Kimi launcher
 # is not available in this vLLM ref" and exits 2. On r4 our bootstrap masked
 # this by replacing the entrypoint outright; here we override only the CMD.
+# Bound the container's json-file log. It was previously UNCAPPED (driver
+# json-file, no opts), so a pathological log storm could grow it without limit.
+# These live on /var/lib/docker, i.e. the EPHEMERAL pod overlay, not the /root
+# NFS PVC -- so they vanish on pod restart regardless; the durable copy is the
+# crashlogs/ capture above. At the observed ~16 MB/day this never rotates; the
+# cap is a runaway guard, and 256m x 4 still holds ~2 months of normal history.
+# `docker logs` reads across rotated files, so capture stays complete.
 docker run -d --name "$NAME" \
+  --log-driver json-file --log-opt max-size=256m --log-opt max-file=4 \
   --device nvidia.com/gpu=all --network host --ipc host --init --shm-size 32g \
   --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=1048576:1048576 \
   -e MODEL_FAMILY=glm52 \
@@ -590,7 +877,9 @@ docker run -d --name "$NAME" \
   -v /root/.cache/huggingface:/root/.cache/huggingface \
   -v "$CACHE_ROOT/cache:/cache" \
   -v "$CACHE_ROOT/tmp:/container-tmp" \
-  "$IMAGE" /usr/local/bin/serve-gilded-gnosis.sh ${EXTRA_VLLM_ARGS:-}
+  "$IMAGE" /usr/local/bin/serve-gilded-gnosis.sh \
+  ${CHAT_TEMPLATE_KWARGS:+--default-chat-template-kwargs $CHAT_TEMPLATE_KWARGS} \
+  ${EXTRA_VLLM_ARGS:-}
 # EXTRA_VLLM_ARGS is appended to the container COMMAND and reaches `vllm serve`
 # through the whole chain: serve-gilded-gnosis.sh -> glm52-lmcache-wrapper.sh
 # (exec "$@" when LMCACHE_MODE=off) -> serve-glm52-v19.sh -> serve-glm52-v16.sh
@@ -602,6 +891,7 @@ docker run -d --name "$NAME" \
 echo "Launched '$NAME' — r20 TP$TP DCP$DCP MTP$MTP $MOE_MODE, PCIe-allreduce=$PCIE,"
 echo "  ctx=$MAX_MODEL_LEN gpu_mem=$GPU_MEMORY_UTILIZATION ckv_gather_max=$DCP_CKV_GATHER_MAX_TOKENS"
 echo "  indexer_shards=$DCP_INDEXER_SHARDS calibration=$([[ $CALIBRATE == 1 ]] && echo probing || echo pinned)"
+echo "  chat_template_kwargs=${CHAT_TEMPLATE_KWARGS:-<image preset: reasoning_effort=high>}"
 echo "  LMCache native: mode=$LMCACHE_MODE L1=${LMCACHE_L1_GB}GB ttl=${LMCACHE_READ_TTL}s"
 echo "                  zmq=$LMCACHE_PORT http=$LMCACHE_HTTP_PORT prom=$LMCACHE_PROMETHEUS_PORT"
 echo

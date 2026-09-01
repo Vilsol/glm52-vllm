@@ -1060,3 +1060,755 @@ eval** on this box and cannot claim quality is unchanged.
   re-bench reads ~1 GiB where boot showed ~3.6 GiB).
 - `GPU_MEMORY_UTILIZATION=0.90` is **below the floor**: 917,504 tokens needs
   23.38 GiB of KV and 0.90 leaves 22.66 GiB. Engine refuses to start.
+
+# Phase 17 — the chat-template prefill collapse, and the GLM-5.3 landscape (2026-08-07..28)
+
+## 1. `clear_thinking`: every user reply was re-prefilling the whole agentic chain
+
+Reported symptom: *"agent completes, asks a question, I answer within a few
+minutes, and then it takes minutes before the response starts."* It looked like
+LMCache eviction. It was not — **nothing was ever evicted**. The prompt text
+changed, so the cached blocks stopped matching.
+
+`chat_template.jinja:70` (GLM-5.2) keeps an assistant turn's `<think>` block only
+while that turn is *after* the last user message:
+
+```jinja
+{%- if ((clear_thinking is defined and not clear_thinking)
+        or loop.index0 > ns.last_user_index) and reasoning_content is defined -%}
+```
+
+During a tool-calling chain `last_user_index` stays pinned at the original
+prompt, so every assistant turn keeps its reasoning and is prefilled+cached that
+way. The moment the user replies, `last_user_index` jumps to the end and **every
+turn in the chain collapses to `<think></think>` at once** — the rendered prefix
+diverges at the *first* assistant turn of the chain.
+
+Measured 2026-08-07, same conversation, same warm cache:
+
+| request | prompt | cached |
+|---|---|---|
+| prime chain X | 27,475 | 27,264 (99.2%) |
+| X + user reply, **default** | 9,331 | **0 (0.0%)** |
+| X + user reply, `clear_thinking=false` | 27,487 | 27,264 (99.2%) |
+
+The default prompt is *smaller* because 18,144 tokens of reasoning were deleted;
+that deletion is exactly why it stops matching. Scales with chain length at
+~5,300 tok/s prefill, and under concurrency the prefill bandwidth is shared, so
+one re-prefill stretches to minutes.
+
+**Second bug in the same flag.** `serve-glm52-v16.sh:411` hardcodes
+`--default-chat-template-kwargs '{"reasoning_effort":"high"}'`, pinning
+`Reasoning Effort: High`. The template defaults to **Max** when the key is
+absent. argparse keeps the LAST occurrence and **replaces** rather than merges,
+so one override fixes both.
+
+Fix shipped as `CHAT_TEMPLATE_KWARGS` in `vllm-v20-r20.sh` (line ~309), appended
+after the image preset. Post-restart verification, cold cache:
+
+```
+                                          prompt    cached
+Y = X + user reply  [production path]     27,487    27,264  (99.2%)   0.5s
+Y + clear_thinking=TRUE (forced control)   9,331         0  ( 0.0%)   2.0s
+```
+
+`/tokenize` confirmed `Reasoning Effort: Max` live. KV 997,631 tokens (was
+998,656 — unchanged). Boot 8m15s, no mq_timeout race.
+
+## 2. Still open: LMCache does not backstop GPU prefix-cache evictions
+
+After the fix the aggregate is healthy but LMCache contributes almost nothing.
+Measured over 35 min of real traffic (383 requests, mean prompt 56,474 tokens):
+
+```
+vllm:prefix_cache_hits / queries            20,385,408 / 21,692,708  =  93.97%  (GPU)
+vllm:external_prefix_cache_hits / queries        10,624 /  1,307,300  =   0.81%  (LMCache)
+lmcache lookup_hit / requested               18,294,272 / 19,531,264  =  93.70%
+```
+
+LMCache *says* it holds 93.7% of what is looked up, but the engine took 10,624
+tokens from it. Cross-checked in `/tmp/lmcache-mp-8443.log`: 664 retrieve events
+x 512 tokens across 8 ranks = **~83 distinct chunks, ~42.5k logical tokens** since
+boot. Each retrieve succeeds in ~30 ms, so the path works — it is just never used.
+
+Ruled out: `l1_evicted_chunks_total` is **absent** (zero evictions) and L1 sat at
+**10.3%** (85 GB / 824.6 GB). L1 capacity is not the problem; 768 GB is right.
+
+GPU-side blocks are dropped fast under concurrency —
+`l0_block_idle_before_evict_seconds`, 79 samples: 30 within 50 s, 40 by 500 s,
+53 by 750 s, all by 1000 s. So a session idle past ~1 min during a busy window
+loses its GPU blocks, and LMCache does not serve them back.
+
+One clean instance captured: **11:42:58–11:43:08**, ~84k tokens prefilled with no
+cache hit, and the per-minute retrieve log shows **zero LMCache retrieves in
+either minute**. Not root-caused. The discriminating question — whether those
+requests are genuinely new conversations or existing sessions whose prefix
+changed again — needs a request body, and nothing proxies :8443, so it needs
+either a timestamp from the user to correlate, or `VLLM_SERVER_DEV_MODE=1` for
+`POST /reset_prefix_cache` (deliberately off: the endpoint is unauthenticated and
+:8443 is network-facing).
+
+## 3. Storage reclamation (2026-08-26..28)
+
+`/root` (NFS PVC, the only persistent filesystem — `/` is ephemeral pod overlay)
+went **253 GiB -> 428 GiB free**, 175 GiB reclaimed:
+
+| what | freed |
+|---|---|
+| `rugrat` ASR/vision models (gemma-4, whisper x4, canary, parakeet) | 76 GiB |
+| 7 orphaned JIT cache roots (no matching local image) | 45 GiB |
+| `.cache/fairseq2` — a single `omniASR-LLM-Unlimited-7B-v2.pt` | 29 GiB |
+| kimi eagle3 drafts x4 + `vllm-kimi-k26-v3/v5` | 25 GiB |
+
+JIT cache roots are keyed by an image fingerprint
+(`LOCAL_INFERENCE_CACHE_FINGERPRINT`), so a root whose image is gone from
+`docker images` is dead weight. Five pre-r20 roots (17 GiB) were **kept** —
+they are the r11/r9 rollback path. `cache-v14/tmp` is undeletable (NFS returns
+`Invalid argument` on readdir); it is 8 KiB, left in place.
+
+Still reclaimable if needed: `.cache/uv` (59 GiB), `.cache/vllm`+`pip` (17 GiB),
+the five pre-r20 JIT roots (17 GiB) — ~93 GiB total.
+
+Use `gdu -np <dir>`, not `du`; `du` on this NFS mount takes minutes.
+
+## 4. GLM-5.3 and GLM-5.3-Flash (2026-08-26..28)
+
+**GLM-5.3-Flash** (08-26) — 320B total / 18B active, MIT, native vision, 1M ctx,
+a *different* architecture (`Glm5NextForConditionalGeneration`: hybrid
+`deepseek_sparse_attention` + `linear_attention`, mHC, IndexPool). ~5.5M KV at
+TP8 vs our 997,631; prefill 18.5–24k tok/s on TP4 with b12x; decode ~134 tok/s
+essentially flat from 0 to 256k context. **Not adopted:** no LMCache (the hybrid
+KV manager is disabled by any `--kv-transfer-config`), no DCP at first, and the
+whole line moved to a new `dev/jovian-judgement` branch — Luke declared `dev/i-i`
+(our r20 lineage) a clean break to be re-ported feature by feature.
+
+**GLM-5.3** (08-28) — *weights-only*. Verified by diffing `config.json` against
+`lukealonso/GLM-5.2-NVFP4`; every dimension is identical:
+
+```
+architectures  GlmMoeDsaForCausalLM   layers 78    hidden 6144   heads 64
+moe_intermediate 2048   n_routed_experts 256   experts_per_tok 8
+vocab 154880   max_position 1048576   num_nextn_predict_layers 1  (MTP present)
+```
+
+festr: *"5.3 is exactly same arch as 5.2 so NO MORE FUCKING NEW DOCKERS ARE
+NEEDED — we just need quants."* **Our r20 launcher should serve it on a
+checkpoint swap alone.**
+
+### GLM-5.3 chat template changed — and it fixes §1 upstream
+
+```jinja
+{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined
+      and reasoning_effort in ['low','high'] else 'max' -%}
+{%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}
+```
+
+Rendered against the real 5.3 template:
+
+| kwargs | effort | prior reasoning |
+|---|---|---|
+| `{"reasoning_effort":"high"}` (image preset) | High | RETAINED |
+| `{"clear_thinking":false}` (ours) | **Max** | RETAINED |
+| none (5.3 defaults) | Max | RETAINED |
+| `{"reasoning_effort":"low"}` | Low | RETAINED |
+
+So on 5.3 our override is redundant for its original purpose; its **only
+remaining effect is High -> Max**. `low` is newly valid; `enable_thinking=false`
+is no longer supported. The 5.3 template also uses `{% break %}` and needs
+`jinja2.ext.loopcontrols` — plain `jinja2.Environment()` throws
+`unknown tag 'break'`. Transformers supplies it, so serving is fine, but any
+tooling of ours that renders the template by hand must add the extension.
+
+### Quant landscape at 2026-08-28 15:46 (50 min after release)
+
+**Nobody had run one.** No tok/s, KV, or Estonia numbers for big 5.3 in either
+channel. Three community NVFP4s existed, all 432.9 GiB, uploaded within minutes:
+`incoai/GLM-5.3-NVFP4` (config verified as the real arch), `Inferact/GLM5.3-NVFP4`,
+`RadixArk/GLM-5.3-NVFP4`. procr2372: *"I think all of them differ from luke's
+GLM-5.2 quant in the MTP layer quantization."* People were pulling BF16 to quant
+locally instead.
+
+**TRAP:** `local-inference-lab/GLM-5.3-NVFP4` is **not** the big 5.3 — its config
+is `Glm5NextForConditionalGeneration` with a vision tower, 185.7 GiB, uploaded
+11 h *before* the 5.3 release. That is Flash under a confusing name.
+
+Luke committed to an NVFP4 *"same recipe as 5.2 (it's the same exact model, so
+it's easy)"*, ~3-4 h on 4 GPUs, no BlockLDLQ data capture needed. brandonmusic on
+EXL3 within 24 h. Community bitrate preference: 3.42 coding, 3.50 general,
+3.25 for 1M context.
+
+### Upstream runbook moved to r34 — do NOT assume it applies to us
+
+`models/glm5.2_v20.md` now pins
+`voipmonitor/vllm:gilded-gnosis-v20-vllm4d006a4-b12xcd3ce19-fi1ac6942-cu132-20260810-r34`.
+Two reasons we stayed on r20:
+
+- Its receipt covers **only the EXL3 R7 TP4/DCP1 profile**. Verbatim: *"The r34
+  qualification receipt covers only the R7 TP4/DCP1 profile."* Our NVFP4
+  TP8/DCP2 + LMCache path ships in the image but is unvalidated.
+- r34 is post-r33, which made `B12X_PCIE_TP8_OWNER_REDUCE` a **default**. That
+  regressed nearly every direct-attach topology (joninco, timricese, procr2,
+  koush all worse; only festr's rig gained). festr, 08-10: *"I have made default
+  a2a which is fast only on my rig it seems… I will fix it in one of the next
+  release also incorporating another case with **4x 2pair gpus**"* — **we are the
+  4x2-pair case.** `grep` finds zero mentions of that flag anywhere in the
+  rtx6kpro repo; it exists only in Discord.
+
+### Disk math for the 5.3 upgrade
+
+433 GiB needed, 428 GiB free — **does not fit** alongside the 5.2 checkpoint
+(436 GiB, our rollback). Reclaiming the ~93 GiB in §3 lands at ~521 GiB free and
+holds both with ~88 GiB spare.
+
+---
+
+# Phase 18 — GLM-5.3 in production: the OOM, the eviction cliff, and preemption (2026-08-29..31)
+
+The 5.3 cutover happened, twice broke production, and turned up **two distinct
+causes of "sudden full prefill"** that had been conflated for weeks. It also
+retired a diagnosis from Phase 17 that turned out to be wrong.
+
+## 1. The cutover: RadixArk NVFP4, and why 917,504 context died
+
+`MODEL_HOST` -> `RadixArk/GLM-5.3-NVFP4` (432.9 GiB, 47 shards, verified
+byte-exact). Weight delta vs lukealonso 5.2 is **entirely the MTP layer**:
+
+| category | 5.2 | 5.3 | delta |
+|---|---:|---:|---:|
+| routed experts | 379.69 GiB | 379.69 GiB | 0.00 |
+| attention | 24.34 | 24.34 | 0.00 |
+| embed / lm_head | 3.54 | 3.54 | 0.00 |
+| shared experts | 5.27 | 5.27 | 0.00 |
+| **MTP (layer 78)** | **5.60** | **18.54** | **+12.94** |
+
+luke *quantized* MTP in 5.2; **every** big-5.3 NVFP4 (RadixArk, incoai,
+Inferact, LIL) leaves it BF16. This cost is inherent to 5.3, not a quant choice.
+
+Per-GPU the MTP shards /8 (+1.62 GiB), but the **profiled peak activation also
+rose 2.25 -> 3.49 GiB** — a BF16 draft layer needs bigger buffers for the three
+MTP forwards. Total KV loss 25.43 -> 22.61 GiB. First boot then refused:
+
+    ValueError: To serve at least one request with the model's max seq len
+    (917504), 23.38 GiB KV cache is needed, which is larger than the available
+    KV cache memory (22.61 GiB). Estimated maximum model length is 886912.
+
+KV costs **26.72 KiB/token** here, so `MAX_MODEL_LEN` 917,504 -> **851,968**
+(4% margin). LESSON: I predicted +1.62 GiB/GPU from pure /8 sharding and was
+wrong by 1.2 GiB because I ignored activation. Always read the printed
+"Free memory on device" line, never project from weights alone.
+
+## 2. Production OOM'd TWICE at GMU 0.93 — the profiled peak understates real load
+
+    MemoryError: CUDA out of memory. Tried to allocate 1.48 GiB.
+    GPU N has a total capacity of 94.97 GiB of which 1.41 GiB is free.
+    ... this process has 91.35 GiB memory in use.
+
+Missed by **70 MiB**, in `speculator.propose() -> _run_model -> _prefill`
+(the MTP=3 draft path), 5 reqs running. 2026-08-28 23:52 and 2026-08-29 00:23.
+
+**The API server catches EngineDeadError and exits 0**, so `docker inspect`
+reports a CLEAN exit and `OOMKilled=false`. This does NOT look like a crash from
+outside. Do not trust the exit code; read the log.
+
+The profiled 3.49 GiB peak is measured under a *synthetic boot run*; real
+concurrency with MTP3 overshot it (91.35 GiB used against an 88.32 GiB budget =
+3.03 GiB of transients living outside the KV budget). Non-budget headroom is
+`(1-GMU)*94.97`, the only knob trading KV for transient safety:
+
+| GMU | headroom | KV tokens | ctx margin @851,968 |
+|---|---:|---:|---:|
+| 0.930 | 6.65 GiB | 886,912 | 4.1% | <- OOM'd twice |
+| **0.925** | **7.12 GiB** | **868,352** | **1.9%** |
+
+**GMU 0.925 has held since 2026-08-29 00:24 (2.5 days, 0 restarts).** Predicted
+868,285 tokens, actual 868,352 — off by 67. If it OOMs again prefer
+`MAX_BATCHED_TOKENS` 8192->4096 (targets the prefill activation peak directly,
+costs no context) over cutting GMU further.
+
+## 3. Crash logs now survive the container
+
+`docker rm -f` deletes `*-json.log` with the container, so every restart
+destroyed the evidence for the failure that caused it. The 08-28 OOM had to be
+salvaged by hand. The launcher now captures **before** teardown into
+`/root/glm52-vllm/crashlogs/` (30 sets retained): container log, the LMCache MP
+log from `/tmp` inside the container (previously ALWAYS lost), and
+`docker inspect` (where `OOMKilled`/exit code live). Every step is
+`timeout`-wrapped and `|| true` so capture can never block a restart.
+Also added `--log-opt max-size=256m --log-opt max-file=4`; the log was uncapped.
+It proved itself on its first real use (00:24 restart, 1.5 MB + 594 KB captured).
+
+## 4. RETRACTED: the LMCache "store window" bug from Phase 17 was WRONG
+
+Phase 17 recorded LMCache serving only 0.81% of GPU-cache misses and I traced it
+to `num_vllm_hit_tokens` never being set on the lookup-miss path. **That
+diagnosis is retracted.** Measured in-session:
+
+    APC queries 72,539,058  hits 70,647,424  (97.4%)
+    lmcache lookup_requested 72,376,320  hit 70,610,944  (97.6%)
+    APC hits - LMCache hits = +36,480 tokens
+
+LMCache holds **essentially exactly what the APC holds**. The low external hit
+rate is *correct*: retrieval only fires when `max(0, ret - num_computed_tokens)
+> 0`, and with LMCache at parity there is nothing extra to fetch. The 0.81% was
+measured in a warm-APC window and over-generalised from one sample.
+
+Independently confirmed by drock01057 (Discord, 08-31 03:01), unprompted:
+*"If a hit is served from APC it won't show up in the LMCache served tokens
+since it was handled by APC... you'd expect APC to serve first, then LMCache
+after GPU eviction."*
+
+Three subagent reviews (correctness / adversarial / upstream-maintainer) all
+found fatal problems with the write-up, the sharpest being that the store window
+is anchored at block 0 and *sized* by scheduled tokens, so a lookup-miss request
+stores the **head** of the prefix — the loop is self-healing, not
+self-perpetuating. Also: **the file I analysed was not the file we run.** vLLM's
+`lmcache_mp_connector.py` ends in `_resolve_lmcache_mp_connector()`, which
+prefers the `lmcache` package's own connector unless `LMCACHE_USE_UPSTREAM_MP`
+is set. We run `lmcache 0.5.2+glm52dcp.4` (1,477 lines), not vLLM's vendored
+1,226-line copy. **Check the boot log for "Using external LMCacheMPConnector"
+before analysing this code.**
+
+## 5. CAUSE A of sudden full prefill: L1 bulk eviction
+
+L1 is **not** the 10.3% recorded on 08-07. It filled over 08-29 and has been at
+the ceiling since:
+
+    08-29 03:07  10.9%  ->  09:07 56.3%  ->  15:07 90.0% (watermark)
+    08-29..31    85.6%  (pinned for 2.5 days)     681.8 GB / 824.6 GB
+
+    l1_evicted_chunks_total           10,594
+    l1_eviction_loop_triggered_total       2      <- only TWICE
+
+**5,298 chunks = 2.71M tokens = ~82 GB dumped per event**, because
+`--eviction-ratio 0.10` discards 10% of the whole cache at once, by LRU. LRU
+victims are exactly the paused agentic sessions about to be resumed. Confirmed
+by LMCache's own histogram: `l1_chunk_evict_reuse_gap_seconds` count=110, all
+<=500s, mean 300s — 110 chunks evicted and needed again within ~5 minutes.
+Event #2 landed 08-31 08:54, ~6 min before a user reported exactly this.
+
+Between events L1 idles at 82-86%, which LOOKS like headroom — that is why this
+reads as "full prefill even though LMCache is not full". It IS full.
+
+Fix (staged, patch 6 in the launcher; knobs are hardcoded in the wrapper so a
+`docker -e` cannot reach them): ratio **0.10 -> 0.02** (blast radius ~82 -> ~16
+GB), watermark **0.90 -> 0.94** (~33 GB more usable). Neither enlarges L1: the
+working set genuinely exceeds 768 GB (10% -> 90% in twelve hours), so the next
+lever is `LMCACHE_L1_GB` (host shows ~1,043 GB available).
+
+## 6. CAUSE B of sudden full prefill: SCHEDULER PREEMPTION (mid-run)
+
+Different symptom, different mechanism: one agent restarts prefill **mid-run**
+while others keep decoding.
+
+    2026-08-29 06:44   vllm:num_preemptions_total  0 -> 6  (single burst)
+    max vllm:kv_cache_usage_perc  1.00   (pool 100% full)
+    max vllm:num_requests_running    5   <- only FIVE concurrent did it
+
+`scheduler.py:1235-1248` frees every KV block and sets
+`request.num_computed_tokens = 0` — a total loss, not a stall. **LMCache cannot
+rescue it**: the connector returns `(0, False)` for PREEMPTED before it even
+looks up (`lmcache_mp_connector.py:1029-1031`, *"TODO: support loading KV for
+preempted requests in the future"*).
+
+Upstream: **LMCache PR #4612** ("reload cached KV for preempted requests",
+Carlos779988, open since 08-17) is exactly this fix, but is blocked on
+store-ordering safety — a GPU block can be released and reassigned while a STORE
+is still pending, risking cache poisoning. **PR #4836** (yatesdr = D-Rock from
+this Discord, opened 08-31) is the missing half. Both OPEN. Taking #4612 alone
+would be unsafe for us. Do not cherry-pick.
+
+Pool arithmetic at 868,352 tokens: 2 sessions -> 434k each, 3 -> 289k,
+4 -> 217k, **5 -> 174k**, 6 -> 145k. Five agentic sessions at ~170k exhausts it,
+which is what the counters recorded. **`MAX_NUM_SEQS` 16 -> 8 staged.** If
+preemptions persist go to 6, then 5.
+
+**The community does not hit this.** Across 11,159 Discord messages "preempt"
+appears **0 times**; every pasted engine log shows `Waiting: 0`, and GPU KV usage
+samples are median 9.6% / max 26.3% (n=10) against our 100%. Our pool/ctx is
+1.02x; daring_hare's folk rule (06-30) is *"1.5-3x your max session"*.
+
+## 7. Quant selection: drock's 64-window KLD matrix (08-30)
+
+First rigorous cross-quant comparison, TP8-tagged for FP8/NVFP4:
+
+| weights + KV | overall KLD | |
+|---|---:|---|
+| Official FP8 + FP8 KV | 0.01968 | best fidelity |
+| **LIL NVFP4 + FP8 KV** | **0.02071** | +5.2%, **recommended start** |
+| EXL3 3.42 + FP8 KV | 0.02386 | +21.3%, best TP4 |
+| EXL3 3.25 + FP8 KV | 0.02657 | |
+| EXL3 3.0 + FP8 KV | 0.03088 | min size |
+
+**Rule 1: always FP8 KV.** NVFP4 KV is catastrophic — LIL NVFP4 goes
+0.02071 -> 0.08343, and on *legal* text 0.0397 -> 0.2642. RoPE8 does not recover
+it. We run `KV_CACHE_DTYPE=fp8`, on the right side of the single biggest factor.
+
+RadixArk (what we ran) is **not in the matrix** — chosen on GSM8K/AIME parity,
+much coarser than 64-window KLD. **`local-inference-lab/GLM-5.3-NVFP4`
+downloaded and verified 08-31** (85 index shards + 2 amax files; note its index
+`total_size` INCLUDES safetensors headers where RadixArk's did not — tensor
+payload is identical to the byte). Luke's producer is `modelopt 0.39.0.dev290`,
+the same version as his 5.2. GLM-5.2 checkpoint deleted to make room; **RadixArk
+5.3 is now the rollback.**
+
+## 8. Image: STAY on gilded-gnosis r20 (now community-confirmed)
+
+Asked directly on 08-31 whether TP8/NVFP4 should pin infernal or gilded,
+mcd6192: *"for tp8, the last gg images work the best imo"*, lavd_48722: *"with
+same compose from 5.2"*. The fork rebased off `infernal-invocation` (declared
+*"unmaintainable"*, r21 final) onto `dev/jovian-judgement`;
+`jovian-judgement-community-20260831-r8` exists but every qualification is
+**Flash on TP4/DCP1**, and r7 shipped with prefix caching broken at DCP4
+(issue #545). Jovian's rewritten B12X PCIe all-reduce independently lands where
+our Phase 16 campaign did — `B12X_PCIE_TP8_OWNER_REDUCE` is **gone**, TP2/4/6/8
+use all-peer one-shot, it is opt-in, and the two oneshot limits are now
+first-class env vars (exactly our patch 4). `GlmMoeDsaForCausalLM` survives,
+relocated to `vllm.models.deepseek_v32`. Three gates before bumping: a container
+exists, a big-5.3 launcher exists, LMCache confirmed working.
+
+## 9. Bench on GLM-5.3 (RadixArk), 2026-08-31, idle box, warm (up 2.5 d)
+
+`llm-inference-bench` updated 86cf05c -> 42c38fd (adds **MTP acceptance-normalized
+decode**, interrupted-run resume, prefill TTFT stream-error fix). Our local
+`LLM_BENCH_MAX_PREFILL` patch (raises the hardcoded 128k prefill ceiling)
+survives the merge — re-apply it after any future pull.
+
+Prefill tok/s: **8k 5,186 · 64k 5,598 · 128k 5,576**
+Aggregate decode @ctx0: **c1 104.9 · c4 293.2 · c8 426.9 · c16 614.9**
+
+vs the GLM-5.2 v19 baseline: decode c1 +3%, c8 -5%, **c16 -11%**, but prefill
+**+37% at 8k and +40% at 128k**. For 100-200k agentic prompts that is the trade
+we want. The c16 softening tracks the smaller KV pool (868k vs 997k) plus the
+heavier BF16 MTP layer.
+
+### Decode vs context — clean cells only
+
+Both concurrency columns, external traffic filtered out (see hygiene note below).
+`steps/s` = engine forward passes/s = `tok/s / accept_len`; it is the metric to
+compare across runs because it divides out MTP acceptance luck.
+
+| ctx | c1 steps/s | c1 tok/s | c4 steps/s | c4 tok/s |
+|---|---:|---:|---:|---:|
+| ctx0 | 38.6 +/- 0.1 (n=2) | 101.1 +/- 3.9 | 108.1 | 283.5 |
+| 8k   | 38.3 +/- 0.0 (n=2) | 107.7 +/- 1.7 | 104.4 | 287.7 |
+| 64k  | 37.7 (n=1) | 93.7 | 100.2 | 269.0 |
+| 128k | 37.6 (n=1) | 99.8 | 97.5 | 267.4 |
+
+**c1 taper 2.8% and c4 taper 9.8% across 128k of context — no cliff.**
+Sparse-MLA + DCP2 CKV gather scale correctly, including at the 128k x 4 =
+524,288-token cell that lands exactly on `DCP_CKV_GATHER_MAX_TOKENS=524288`.
+
+**n=1 is enough for steps/s.** On the two cells with repeats, `steps/s` sd was
+**0.1 and 0.0** while `tok/s` sd was 3.9 and 1.7 — all run-to-run scatter lives
+in MTP acceptance, which steps/s removes by construction. Do not burn production
+time collecting repeats of steps/s; collect repeats only if you need tok/s.
+
+**BENCH HYGIENE — the tool does NOT detect external traffic during decode
+cells.** It waits for a genuinely idle server before/after the prefill scout and
+flags `underfilled` (avg_running < 0.98x requested), but has no check for
+avg_running being *higher* than requested. Two c1 cells in the context matrix
+were polluted by real user traffic (64k: avg_running 1.9/max 2; 128k: 1.3/2) and
+both were reported `underfilled: False`. **Always check
+`avg_running_reqs`/`max_running_reqs` per cell against requested concurrency
+before trusting a number taken on a live box.**
+
+`agg-clean-cells.py` (this repo) applies the rule the tool lacks —
+`clean = max_running_reqs <= concurrency and not underfilled` — prints every run
+with its avg/max for audit, then aggregates clean samples only with n and sd.
+Run it over every bench JSON before quoting a number.
+
+**Long-context c1 cells are effectively unmeasurable on this box during working
+hours.** 64k c1 was contaminated in **3 of 4** attempts and 128k c1 in 3 of 4,
+while EVERY c4 cell and every short-context cell stayed clean. It is structural,
+not luck: a 64k/128k cell needs a 12-25 s prefill before its 15 s measurement, so
+it presents a ~40 s window for a real request to land, where an 8k cell presents
+~17 s. Measure long-context c1 overnight, or rely on the c4 column.
+
+How badly contamination distorts a cell (same 64k/128k c1 cells, dirty runs):
+
+| cell | clean | dirty samples | intruder |
+|---|---:|---|---|
+| 64k c1 steps/s | **37.7** | 29.6 · 29.0 · 21.5 | avg_running 1.9 / 1.6 / 1.5 |
+| 128k c1 steps/s | **37.6** | 35.5 · 33.4 · **6.1** | avg_running 1.3 / 1.1 / **4.8** |
+
+The worst case (128k, avg_running 4.8, max 6) read **20.4 tok/s vs 99.8 clean —
+a 5x slowdown**. That is also a free measurement of what a user's session feels
+like under pool contention, and is the case `MAX_NUM_SEQS=8` (SS6) bounds.
+
+The new MTP-normalized metric earned its keep immediately: ctx0 c1 read 93.8
+tok/s on one run and 104.9 on another — an alarming 11% "regression" — but
+steps/s was 38.7 vs 38.6, i.e. identical engine throughput, with the whole
+difference being MTP acceptance variance (2.42 vs 2.72). Compare steps/s, not
+tok/s, across runs.
+
+---
+
+# Phase 19 — the DCP ladder, measured end to end (2026-08-31)
+
+Phase 18 left two open levers: a KV pool at 1.02x of context (which was
+preempting) and an untested claim that DCP8 is unusable here. Both are now
+settled by measurement on the SAME host, image and checkpoint, back to back.
+
+## 1. The ladder
+
+All on r20, TP8, MTP3, GMU 0.925, FP8 KV, LIL NVFP4, ctx 851,968,
+`MAX_NUM_SEQS=8`. Decode is MTP-normalized steps/s from clean cells only.
+
+| config | KV pool | pool/ctx | indexer shards | c1 | c4 | c8 | prefill 8k / 128k |
+|---|---:|---:|---:|---:|---:|---:|---|
+| DCP2 | 868,352 | 1.02x | 0 | 38.6 | 107.6 | 153.0 | 5,186 / 5,576 |
+| **DCP4** | **1,706,495** | **2.00x** | **2** | **37.2** | **100.2** | **140.0** | **5,227 / 5,487** |
+| DCP8 | 3,363,328 | 3.95x | 4 | 19.7 | 24.5 | 26.1 | — |
+
+KV scales almost perfectly linearly with DCP (1.97x then 1.97x again).
+
+## 2. DCP4 is close to free — my own prediction was wrong
+
+Phase 8 warned DCP4 would **halve** prefill. It did not: 5,487 vs 5,576 tok/s at
+128k, a 1.6% difference. That warning came from DCP4-vs-DCP1 numbers on the June
+**v11** image, taken before r20's CKV gather. **Old topology measurements on this
+box go stale; re-measure before trusting them.** MTP acceptance also held
+(~2.6-2.7), where Phase 8 predicted a collapse to ~1.9.
+
+Total cost of DCP4: **~3-8% decode, ~2% prefill.** In exchange the pool doubles
+and preemptions went from 15 (accumulated on DCP2) to **ZERO across a full bench
+battery**. That trade is not close. Preemption is a TOTAL loss — `scheduler.py`
+frees every KV block and sets `num_computed_tokens = 0`, and LMCache refuses
+PREEMPTED requests outright — so one avoided re-prefill of a 150k prompt buys
+back far more than 5% of decode. Credit where due: the operator made exactly this
+argument before the trial, and the data confirmed it.
+
+New capability at DCP4 (previously unmeasurable — 512k did not fit the DCP2 pool
+alongside anything else):
+
+    256k c1  35.7 steps/s  97.9 tok/s
+    512k c1  33.9 steps/s  88.5 tok/s   <- 91% of ctx0 decode speed
+
+## 3. DCP8 IS A TRAP — now measured twice, two images apart
+
+    steps/s   DCP4    DCP8    delta
+    c1        37.2    19.7    -47%
+    c4       100.2    24.5    -76%
+    c8       140.0    26.1    -81%     (aggregate 384 -> 73.5 tok/s, 5.2x)
+
+It barely scales with concurrency at all — 19.7 -> 24.5 -> 26.1 for 1 -> 4 -> 8
+requests, i.e. 8x the load buys 33% more work. That is the signature of a
+communication-bound decode: every token needs an 8-way all-reduce across our
+PCIe-only 2-NUMA fabric (GPU0-3 / 4-7), and it dominates everything else.
+
+**MTP acceptance at DCP8 was FINE (2.77-2.81, our best readings)**, which rules
+out speculation as the cause and points squarely at the collective. r20's CKV
+gather and 4-way indexer sharding did NOT move it, even though they clearly
+fixed DCP4. This reproduces the v19 finding of 2026-07-21 (Phase 13) on a
+completely different image. Do not retry without a topology change.
+
+**DCP=6 does not exist at TP8.** DCP must divide TP, so the legal values are
+1, 2, 4, 8. The Discord "dcp6" reports are all TP6/DCP6 — six GPUs total, which
+would idle 2 of our 8 and raise per-GPU weight bytes; their pools were 773,766
+and 999,064, BELOW our DCP4.
+
+## 4. Production defaults changed
+
+    MODEL_HOST      RadixArk    -> local-inference-lab (Luke) GLM-5.3-NVFP4
+    DCP             2           -> 4
+    MAX_MODEL_LEN   851,968     -> 1,048,576     (1M restored; 512-aligned)
+    MAX_NUM_SEQS    16          -> 8
+    GPU_MEMORY_UTIL 0.93        -> 0.925         (applied 08-29)
+
+BOOTED AND VERIFIED 2026-08-31 16:02:45:
+
+    GPU KV cache size: 1,708,544 tokens
+    Maximum concurrency for 1,048,576 tokens per request: 1.63x
+    Available KV cache memory: 22.88 GiB/GPU
+    health 200 · serving local-inference-lab--GLM-5.3-NVFP4 · ctx 1,048,576
+    coherence check "17*23" -> 391 · preemptions 0
+
+1.63x pool/ctx — back inside the 1.5-3x band and up from the 1.02x that was
+preempting, while giving back the full 1M context that Phase 18 had to cut to
+851,968. Watchdog re-armed 16:05:34 (it calls the same launcher, so its restarts
+now land on DCP4 + 1M rather than reverting).
+
+## 5. Boot cost: it is NOT dominated by tensor loading
+
+Timed on a warm-page-cache boot (buff/cache 1013 GiB, weights resident):
+
+    15:41:36  process start
+    15:41:51  engine init                    (+15s)
+    15:42:11  NCCL / parallel_state
+    15:44:22  "Loading weights took 1.29 seconds"      <- the actual file read
+    15:44:23  "Model loading took 61.77 GiB and 124.6 seconds"
+    15:45:31  "torch.compile took 67.25 s in total"
+              (one graph for compile range (1,8192) = 40.8 s)
+    15:45:40  memory profiling, then CUDA graph capture
+
+So ~125 s of "model loading" is NOT I/O — it is NVFP4 dequant setup, B12X MoE
+descriptor construction over 232,385 tensors, and the InstantTensor BUFFERED
+copy to GPU. Warm boot ~6-8 min; cold boot ~27 min, the difference being 433 GiB
+of NFS reads at ~200 MB/s.
+
+**Therefore: BATCH CONFIG CHANGES INTO ONE SESSION.** Back-to-back restarts are
+~6 min each because the page cache stays warm; an isolated restart after a long
+run costs ~27 min because LMCache's L1 growth has evicted the weights. We did
+DCP4 -> DCP8 -> DCP4 -> 1M in one afternoon at warm cost.
+
+A RAM cache for the NFS mount would only remove the ~22 min of reads, leaving the
+~6 min floor. Options if ever wanted: `vmtouch -l` on the snapshot dir (best —
+locks the already-cached pages, no copy; we have CAP_SYS_ADMIN), or lowering
+`LMCACHE_L1_GB` 768 -> ~500 to stop L1 evicting the weights. A tmpfs copy is
+worst: permanent 433 GiB cost and lost on pod restart.
+
+## 6. OPERATIONAL — two ways this session broke production
+
+**The watchdog races manual restarts.** It calls the same launcher, so a manual
+`docker rm -f` + `docker run` looks like an engine death and it fires its own
+restart ~60 s later, with the SCRIPT DEFAULTS — silently overriding whatever
+override you were trialling. STOP IT before any trial:
+`kill -TERM <pid>` (verify with `/proc/<pid>/cmdline`, never `pkill -f`), and
+re-arm afterwards with `nohup bash glm52-watchdog.sh >/dev/null 2>&1 &`.
+Promote a trial to a DEFAULT before re-arming, or the next restart reverts it.
+
+**A launcher run tears down the container BEFORE it can fail.** `trial-dcp4.sh`
+was issued and then interrupted; the interrupt landed after the script had
+already run its crashlog capture and `docker rm -f` (exit 137) but before
+`docker run`. Production was down with no watchdog to recover it. The teardown
+is effectively the point of no return — treat launching as irreversible once
+started.
+
+---
+
+# Phase 20 — closing DCP8 for good, and the owner-merge A/B (2026-09-01)
+
+Phase 19 called DCP8 a topology wall on two measurements. flobernd then posted a
+DCP8 config on comparable hardware showing only a **-8..-20%** penalty, which
+made our -81% look like a configuration error rather than a fabric limit. This
+phase tested that, flag by flag. It was not a configuration error.
+
+## 1. flobernd's claim, and why it was worth chasing
+
+From #glm-53, 2026-09-01, 8x RTX PRO 6000, GG r34, DCP8 vs DCP4:
+
+    prefill  8k -16.8% · 32k -18.2% · 64k -19.0% · 128k -19.8%
+    decode   c1@32k -8.7% · c1@256k -10.5% · c1@512k -7.5% · c4@32k -17.8%
+
+He saw our HOST-TOPOLOGY.md and said it matches his ASUS ESC800A-E13P. vilsol
+in-channel: *"I am seeing total collapse, TO 20%, not BY 20%."* Two similar
+boxes, opposite outcomes, and he published his full compose — so the differences
+were enumerable.
+
+## 2. A/B #1 — `DCP_TOPK_OWNER_MERGE=0` at our production DCP4
+
+Run first at DCP4 (not DCP8) so it was a true A/B against numbers measured the
+previous day on this exact box, and so a regression would be cheap to learn.
+
+| cell | owner-merge=1 | owner-merge=0 | delta |
+|---|---:|---:|---:|
+| ctx0 c1 | 37.2 | 38.1 | +2.4% |
+| ctx0 c4 | 100.2 | 100.8 | +0.6% |
+| ctx0 c8 | 140.0 | 140.0 | 0.0% |
+| 128k c4 | 92.1 | 94.0 | +2.1% |
+| 256k c1 | 35.7 | 37.0 | +3.6% |
+| 512k c1 | 33.9 | 36.2 | +6.8% |
+| KV pool | 1,708,544 | 1,752,832 | +2.6% |
+
+Decode improves, and the gain grows with context. **But prefill regresses
+everywhere:**
+
+| ctx | om=1 | om=0 | delta |
+|---|---:|---:|---:|
+| 8k | 5,227 | 4,773 | -8.7% |
+| 64k | 5,494 | 5,047 | -8.1% |
+| 128k | 5,487 | 5,078 | -7.5% |
+| 256k | 5,244 | 4,865 | -7.2% |
+| 512k | 4,697 | 4,370 | -7.0% |
+
+That is mechanically sensible — owner-merge is a PREFILL policy knob, so
+disabling it should cost prefill and may free decode-side work. **REJECTED for
+our workload:** 71% of prompts are 100-200k, so a ~8% prefill loss is felt on
+nearly every request while a 2-3% decode gain is not (the 6.8% only appears at
+512k). TTFT at 128k went 23.5s -> 25.4s.
+
+Also disposes of an untested lead carried since Phase 16: `DCP_TOPK_OWNER_MERGE=0`
+is real but not free, and **not** load-bearing for decode at DCP4.
+
+## 3. DCP8 is closed — four runs, nothing moves it
+
+| config | c1 | c4 | c8 |
+|---|---:|---:|---:|
+| DCP4 (production) | 38.1 | 100.8 | 140.0 |
+| DCP8 om=1, shards=auto, pcie=1 (08-31) | 19.7 | 24.5 | 26.1 |
+| DCP8 om=0, shards=0, pcie=1 | 20.0 | 24.4 | 26.0 |
+| DCP8 om=0, shards=0, **pcie=0** | 20.2 | 24.4 | 26.0 |
+| v19 DCP8 (July, different image) | equivalent collapse | | |
+
+c4 and c8 are identical to the decimal across every variant. The PCIe test was
+verified to have applied — the image logged *"Custom allreduce is disabled for
+>2 PCIe-only GPUs"*, i.e. we ran DCP8 on plain NCCL exactly as flobernd does,
+and decode did not move.
+
+**What DCP8's collapse is NOT** (each ruled out by measurement, do not re-test):
+- not KV-size or GMU related — **the collapse is fully present at ctx0**, where
+  the KV cache is empty. GMU only sizes KV, so it cannot be the cause.
+- not `DCP_TOPK_OWNER_MERGE`
+- not `DCP_INDEXER_SHARDS` (auto->4 vs forced 0)
+- not our custom `cpp` PCIe all-reduce / Phase 16 tuning
+
+It is the raw 8-way collective on a PCIe-only 2-NUMA fabric. The signature is
+the concurrency scaling: **20 -> 24 -> 26 steps/s for 1 -> 4 -> 8 requests** —
+8x the work for 30% more throughput is a fixed per-step communication cost being
+amortised, not a memory or policy effect. KV pool at DCP8 reaches 3.5M (3.36x)
+and is simply not purchasable at this price.
+
+## 4. So what makes flobernd fast?
+
+Not a flag — that is now measured. The remaining differences, in rough order of
+suspicion:
+
+- **image: GG r34 vs our r20.** r33 changed the B12X PCIe collective defaults.
+  This is the one open lead and is testable at DCP4 with no topology risk.
+- **KV pin: `GPU_MEMORY_UTILIZATION 0.80` + explicit
+  `--kv-cache-memory-bytes=7516192768` (7 GiB/rank) vs our 22.88 GiB/rank.**
+  His comment: *"GPU memory utilisation is a non-binding precondition; KV size
+  is pinned explicitly."* Unlikely to be the cause (see the ctx0 argument above)
+  but it is a very different allocator regime.
+- `VLLM_B12X_ABSORB_BMM=1` (he sets, we do not)
+- `VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD=0` (he sets, we do not)
+- `MAX_BATCHED_TOKENS` 4096 vs our 8192
+- a real hardware difference his topology file does not capture (he is on a
+  two-node Turin system).
+
+## 5. Community position on images, 2026-09-01
+
+The r7/r8/r10/r11 traffic that appeared in the big-5.3 channel is **Flash** work
+posted there by mistake. festr, asked directly *"the r9 is for glm-5.3 or
+flash?"*: **"flash"**, adding *"JJ does not have any optimisations for the glm
+5.2"*. Beware a genuine r-number collision: gilded-gnosis v20 also had
+r8/r9/r10/r11 in July 2026.
+
+For big 5.3 the guidance is the line we are already on — sininspira relaying
+Luke: *"if you're using full 5.3 and not flash, you should be sticking to
+infernal or gilded. Luke said if he were serving it, he'd probably serve it on
+gilded, as 5.3 is a drop-in replacement for 5.2."* sininspira and jackzampolin
+both run **r34**; johnblackwell6000 could not start 5.3 on ii-r18 but *"gg-r33
+worked fine"*.
+
+Also of note: LMCache output corruption is being reported on the Flash images
+(bobisreallycool: *"output corruption and 'dumbness' is really high"*;
+logprobz: no issues *"with no lmcache"*). D-Rock filed the mechanism as LMCache
+**#4835** — *"recompute failed retrieve spans instead of decoding over cache
+pages that were not populated"* — plus **#4832** (coherent eviction of
+distributed chunk families, which applies to us now that we run DCP4) and
+**#4834**. All open. **We are not affected as of 2026-09-01:** 698 requests over
+17h with `stop 698 / error 0 / abort 0 / repetition 0`, zero errors in the
+LMCache MP log, and we run `kv_load_failure_policy='fail'` (vLLM #49250 reports
+`'recompute'` — flobernd's setting — gives wrong output).
+
+## 6. Operational: the pattern-match self-kill, third occurrence
+
+`pkill -f <pattern>` and `pgrep -f <pattern>` MATCH THE SHELL RUNNING THEM.
+This has now killed a command three times in this project (twice during storage
+cleanup, once killing the DCP8 battery, exit 144). It also silently produced a
+WRONG watchdog PID earlier today when `pgrep -f glm52-watchdog.sh` matched the
+grep itself. **Always** resolve a PID via `readlink /proc/<pid>/exe` plus an
+explicit `$$` exclusion, and confirm with `tr '\0' ' ' < /proc/<pid>/cmdline`
+before signalling anything.
+
